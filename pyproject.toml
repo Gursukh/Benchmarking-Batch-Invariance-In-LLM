@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "batch_invariance_bench"
+version = "0.1.0"
+description = "Benchmark harness for measuring variance from batch-invariance solutions in vLLM."
+requires-python = ">=3.10"
+dependencies = [
+    "vllm",
+    "torch",
+    "transformers",
+    "datasets",
+    "pandas",
+    "nltk",
+    "immutabledict",
+    "langdetect",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.12",
+]
