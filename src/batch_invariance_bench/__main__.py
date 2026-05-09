@@ -17,4 +17,4 @@ tasks = [MATH500(), AIME(), IFEval()]
 
 
 if __name__ == "__main__":
-    print(f"wrote {run(engines=engines, tasks=tasks)}")
+    print(f"wrote {run(engines=engines, tasks=tasks, n=1)}")

@@ -6,6 +6,8 @@ from statistics import mean, pstdev
 
 def pass_at_k(n: int, c: int, k: int) -> float:
     """Unbiased pass@k from Chen et al. (HumanEval): n samples, c correct."""
+    if k > n:
+        return float("nan")
     if n - c < k:
         return 1.0
     return 1.0 - math.comb(n - c, k) / math.comb(n, k)

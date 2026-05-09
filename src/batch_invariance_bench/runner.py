@@ -26,7 +26,7 @@ def run(
     engines: Sequence[Engine],
     tasks: Sequence[Task],
     batch_sizes: Sequence[int] = (1, 2, 4, 6, 8, 16),
-    n: int = 8,
+    n: int = 1,
     seed: int = 0,
     sampling: dict | None = None,
     out_path: str | Path | None = None,
