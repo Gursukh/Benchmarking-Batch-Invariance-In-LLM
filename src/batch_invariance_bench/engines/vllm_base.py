@@ -45,7 +45,7 @@ class VLLMBase(Engine):
     ) -> list[list[str]]:
         assert self._llm is not None, "call setup() first"
         params = SamplingParams(n=n, **{**self.default_sampling, **(sampling or {})})
-        outputs = self._llm.generate(prompts, params)
+        outputs = self._llm.generate(prompts, params, use_tqdm=False)
         return [[o.text for o in req.outputs] for req in outputs]
 
     def teardown(self) -> None:

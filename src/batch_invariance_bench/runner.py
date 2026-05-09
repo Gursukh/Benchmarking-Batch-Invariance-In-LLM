@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import time
 import uuid
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -37,13 +38,19 @@ def run(
     arch, gpu_name = gpu_info()
     vllm_v = vllm_version()
     sampling = {**(sampling or {}), "seed": seed}
+    print(f"[run] out={out} engines={len(engines)} tasks={len(tasks)} bs={list(batch_sizes)} n={n}", flush=True)
 
     for engine in engines:
+        t0 = time.perf_counter()
+        print(f"[{engine.name}] setup...", flush=True)
         engine.setup()
+        print(f"[{engine.name}] ready ({time.perf_counter() - t0:.1f}s)", flush=True)
         try:
             for task in tasks:
                 items = task.load()
                 for bs in batch_sizes:
+                    t_bs = time.perf_counter()
+                    print(f"[{engine.name} | {task.name} | bs={bs}] {len(items)} items", flush=True)
                     for batch in _chunked(items, bs):
                         prompts = [it["prompt"] for it in batch]
                         completions = engine.generate(prompts, n=n, sampling=sampling)
@@ -74,7 +81,9 @@ def run(
                                 }
                             )
                         append_rows(out, rows)
+                    print(f"[{engine.name} | {task.name} | bs={bs}] done ({time.perf_counter() - t_bs:.1f}s)", flush=True)
         finally:
             engine.teardown()
+            print(f"[{engine.name}] teardown", flush=True)
 
     return out
