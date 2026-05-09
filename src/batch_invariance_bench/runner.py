@@ -50,7 +50,9 @@ def run(
                 items = task.load()
                 for bs in batch_sizes:
                     t_bs = time.perf_counter()
-                    print(f"[{engine.name} | {task.name} | bs={bs}] {len(items)} items", flush=True)
+                    total = len(items)
+                    idx = 0
+                    print(f"[{engine.name} | {task.name} | bs={bs}] {total} items", flush=True)
                     for batch in _chunked(items, bs):
                         prompts = [it["prompt"] for it in batch]
                         completions = engine.generate(prompts, n=n, sampling=sampling)
@@ -80,8 +82,10 @@ def run(
                                     "timestamp": _dt.datetime.utcnow().isoformat(),
                                 }
                             )
+                            idx += 1
+                            print(f"\r  [{idx}/{total}]", end="", flush=True)
                         append_rows(out, rows)
-                    print(f"[{engine.name} | {task.name} | bs={bs}] done ({time.perf_counter() - t_bs:.1f}s)", flush=True)
+                    print(f"\r[{engine.name} | {task.name} | bs={bs}] done {total}/{total} ({time.perf_counter() - t_bs:.1f}s)", flush=True)
         finally:
             engine.teardown()
             print(f"[{engine.name}] teardown", flush=True)
