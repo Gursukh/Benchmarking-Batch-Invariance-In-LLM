@@ -9,6 +9,7 @@ from typing import Iterable, Sequence
 
 from batch_invariance_bench.engine import Engine
 from batch_invariance_bench.io import (
+    _slug,
     append_rows,
     default_output_path,
     gpu_info,
@@ -32,13 +33,14 @@ def run(
     sampling: dict | None = None,
     out_path: str | Path | None = None,
 ) -> Path:
-    """Sweep engines x tasks x batch_sizes; one CSV row per problem-cell."""
-    out = Path(out_path) if out_path else default_output_path()
+    """Sweep engines x tasks x batch_sizes; one CSV per (gpu, engine, task)."""
+    out_dir = Path(out_path) if out_path else default_output_path().parent
+    out_dir.mkdir(parents=True, exist_ok=True)
     run_id = uuid.uuid4().hex[:12]
     arch, gpu_name = gpu_info()
     vllm_v = vllm_version()
     sampling = {**(sampling or {}), "seed": seed}
-    print(f"[run] out={out} engines={len(engines)} tasks={len(tasks)} bs={list(batch_sizes)} n={n}", flush=True)
+    print(f"[run] out_dir={out_dir} engines={len(engines)} tasks={len(tasks)} bs={list(batch_sizes)} n={n}", flush=True)
 
     for engine in engines:
         t0 = time.perf_counter()
@@ -48,6 +50,9 @@ def run(
         try:
             for task in tasks:
                 items = task.load()
+                task_out = out_dir / f"{_slug(gpu_name)}.{_slug(engine.name)}.{_slug(task.name)}.csv"
+                t_task = time.perf_counter()
+                row_count = 0
                 for bs in batch_sizes:
                     t_bs = time.perf_counter()
                     total = len(items)
@@ -84,10 +89,12 @@ def run(
                             )
                             idx += 1
                             print(f"\r  [{idx}/{total}]", end="", flush=True)
-                        append_rows(out, rows)
+                        append_rows(task_out, rows)
+                        row_count += len(rows)
                     print(f"\r[{engine.name} | {task.name} | bs={bs}] done {total}/{total} ({time.perf_counter() - t_bs:.1f}s)", flush=True)
+                print(f"[{engine.name} | {task.name}] wrote {row_count} rows -> {task_out} ({time.perf_counter() - t_task:.1f}s)", flush=True)
         finally:
             engine.teardown()
             print(f"[{engine.name}] teardown", flush=True)
 
-    return out
+    return out_dir
