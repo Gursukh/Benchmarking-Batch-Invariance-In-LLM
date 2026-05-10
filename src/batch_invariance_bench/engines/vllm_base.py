@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 
 import torch
+from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
 from batch_invariance_bench.engine import Engine, Sample
@@ -27,18 +28,30 @@ class VLLMBase(Engine):
         "enable_chunked_prefill": False,
     }
 
+    chat_template_kwargs: dict = {"enable_thinking": False}
+
     default_sampling: dict = DEFAULT_SAMPLING
 
     def __init__(self, name: str | None = None) -> None:
         self.name = name or f"{type(self).__name__}::{self.hf_id}"
         self._llm: LLM | None = None
+        self._tokenizer = None
 
     def setup(self) -> None:
+        self._tokenizer = AutoTokenizer.from_pretrained(self.hf_id)
         self._llm = LLM(
             model=self.hf_id,
             dtype=self.dtype,
             max_model_len=self.max_model_len,
             **self.vllm_kwargs,
+        )
+
+    def _apply_chat_template(self, prompt: str) -> str:
+        return self._tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+            **self.chat_template_kwargs,
         )
 
     def generate(
@@ -49,7 +62,8 @@ class VLLMBase(Engine):
     ) -> list[list[Sample]]:
         assert self._llm is not None, "call setup() first"
         params = SamplingParams(n=n, **{**self.default_sampling, **(sampling or {})})
-        outputs = self._llm.generate(prompts, params, use_tqdm=False)
+        chat_prompts = [self._apply_chat_template(p) for p in prompts]
+        outputs = self._llm.generate(chat_prompts, params, use_tqdm=False)
 
         result: list[list[Sample]] = []
         for req in outputs:
@@ -85,6 +99,7 @@ class VLLMBase(Engine):
     def teardown(self) -> None:
         del self._llm
         self._llm = None
+        self._tokenizer = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
