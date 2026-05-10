@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import re
-
 from datasets import load_dataset
 
-from batch_invariance_bench.tasks.base import Item, ScoreResult, Task
-from batch_invariance_bench.tasks.math500 import _extract_boxed
+from batch_invariance_bench.tasks.base import Item, Task
 
 
 PROMPT_TEMPLATE = (
@@ -15,20 +12,8 @@ PROMPT_TEMPLATE = (
 )
 
 
-def _extract_int(text: str) -> int | None:
-    boxed = _extract_boxed(text)
-    candidate = boxed if boxed is not None else text
-    m = re.findall(r"-?\d+", candidate)
-    if not m:
-        return None
-    try:
-        return int(m[-1])
-    except ValueError:
-        return None
-
-
 class AIME(Task):
-    """AIME problems — integer answers in [0, 999]."""
+    """AIME problems. Answers are non-negative integers in [0, 999]."""
 
     name = "aime"
 
@@ -62,10 +47,3 @@ class AIME(Task):
                 )
             )
         return items
-
-    def score(self, item: Item, completions: list[str]) -> ScoreResult:
-        gold = int(item["reference"])
-        extracted_ints = [_extract_int(c) for c in completions]
-        extracted = ["" if x is None else str(x) for x in extracted_ints]
-        correct = [x == gold for x in extracted_ints]
-        return ScoreResult(correct=correct, extracted=extracted)

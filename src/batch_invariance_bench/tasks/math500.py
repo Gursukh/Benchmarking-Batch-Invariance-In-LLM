@@ -1,69 +1,14 @@
 from __future__ import annotations
 
-import re
-
 from datasets import load_dataset
 
-from batch_invariance_bench.tasks.base import Item, ScoreResult, Task
+from batch_invariance_bench.tasks.base import Item, Task
 
 
 PROMPT_TEMPLATE = (
     "Solve the following math problem. Show your reasoning, then write the "
     "final answer inside \\boxed{{}}.\n\nProblem: {problem}"
 )
-
-
-def _extract_boxed(text: str) -> str | None:
-    """Contents of the last \\boxed{...}, brace-matched. None if absent."""
-    idx = text.rfind("\\boxed{")
-    if idx == -1:
-        return None
-    i = idx + len("\\boxed{")
-    depth = 1
-    out = []
-    while i < len(text) and depth:
-        c = text[i]
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                break
-        out.append(c)
-        i += 1
-    return "".join(out) if depth == 0 else None
-
-
-_NORMALIZE_SUBS = [
-    (r"\\left", ""),
-    (r"\\right", ""),
-    (r"\\!", ""),
-    (r"\\,", ""),
-    (r"\\;", ""),
-    (r"\\:", ""),
-    (r"\\\\", ""),
-    (r"\\dfrac", r"\\frac"),
-    (r"\\tfrac", r"\\frac"),
-    (r"\s+", ""),
-]
-
-
-def _normalize(s: str) -> str:
-    s = s.strip()
-    if s.startswith("$") and s.endswith("$"):
-        s = s[1:-1]
-    for pat, repl in _NORMALIZE_SUBS:
-        s = re.sub(pat, repl, s)
-    return s.rstrip(".")
-
-
-def _equal(a: str, b: str) -> bool:
-    if _normalize(a) == _normalize(b):
-        return True
-    try:
-        return float(a) == float(b)
-    except (ValueError, TypeError):
-        return False
 
 
 class MATH500(Task):
@@ -87,9 +32,3 @@ class MATH500(Task):
                 )
             )
         return items
-
-    def score(self, item: Item, completions: list[str]) -> ScoreResult:
-        gold = str(item["reference"])
-        extracted = [_extract_boxed(c) or "" for c in completions]
-        correct = [_equal(e, gold) if e else False for e in extracted]
-        return ScoreResult(correct=correct, extracted=extracted)

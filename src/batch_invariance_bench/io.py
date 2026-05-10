@@ -8,29 +8,29 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 
-CSV_COLUMNS = [
+OUTPUT_COLUMNS = [
     "run_id",
     "gpu_arch",
     "gpu_name",
     "engine",
-    "task",
-    "batch_size",
-    "problem_id",
-    "n_samples",
-    "pass_at_1",
-    "pass_at_4",
-    "mean_resp_len",
-    "std_resp_len",
-    "completions_json",
-    "correct_mask",
-    "seed",
     "vllm_version",
+    "task",
+    "problem_id",
+    "batch_size",
+    "sample_idx",
+    "completion_text",
+    "completion_token_ids",
+    "output_logprobs",
+    "n_prompt_tokens",
+    "n_output_tokens",
+    "finish_reason",
+    "stop_reason",
     "timestamp",
 ]
 
 
 def gpu_info() -> tuple[str, str]:
-    """(arch, name) — e.g. ('sm_90', 'NVIDIA H100'). ('cpu', 'cpu') if no GPU."""
+    """Returns (arch, name), e.g. ('sm_90', 'NVIDIA H100'), or ('cpu', 'cpu')."""
     try:
         import torch
     except ImportError:
@@ -63,12 +63,12 @@ def default_output_path(out_dir: str | os.PathLike = "results") -> Path:
 
 
 def append_rows(path: str | os.PathLike, rows: Iterable[Mapping[str, object]]) -> None:
-    """Append rows; write the header iff the file is new/empty."""
+    """Append rows to a CSV, writing a header row if the file is new."""
     p = Path(path)
     is_new = not p.exists() or p.stat().st_size == 0
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS, extrasaction="ignore")
         if is_new:
             writer.writeheader()
         for row in rows:

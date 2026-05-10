@@ -7,12 +7,7 @@ from typing import TypedDict
 class Item(TypedDict, total=False):
     id: str
     prompt: str
-    reference: str | int | float | dict
-
-
-class ScoreResult(TypedDict):
-    correct: list[bool]
-    extracted: list[str]
+    reference: str | int | float | dict | list
 
 
 class Task(ABC):
@@ -20,6 +15,3 @@ class Task(ABC):
 
     @abstractmethod
     def load(self) -> list[Item]: ...
-
-    @abstractmethod
-    def score(self, item: Item, completions: list[str]) -> ScoreResult: ...

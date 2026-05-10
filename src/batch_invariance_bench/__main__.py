@@ -1,4 +1,4 @@
-"""Edit `engines` to register the cells you want; then `python -m batch_invariance_bench [--out PATH]`."""
+"""Edit the `engines` list below, then run `python -m batch_invariance_bench`."""
 
 from __future__ import annotations
 
@@ -15,11 +15,31 @@ engines = [
     VLLMTMBatchInvariant(),
 ]
 
-tasks = [MATH500(), AIME(), IFEval()]
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog="batch_invariance_bench")
-    parser.add_argument("--out", default=None, help="Output directory (default: results/). One CSV per (gpu, engine, task) is written here.")
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Where to write the output CSVs (default: results/).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Cap problems per task. Handy for a quick smoke test.",
+    )
+    parser.add_argument(
+        "--batch-sizes",
+        default=None,
+        help="Comma-separated batch sizes (e.g. '1,2,4'). Default: 1,2,4,6,8,16.",
+    )
     args = parser.parse_args()
-    print(f"wrote {run(engines=engines, tasks=tasks, n=1, out_path=args.out)}")
+
+    tasks = [MATH500(limit=args.limit), AIME(limit=args.limit), IFEval(limit=args.limit)]
+
+    kwargs: dict = {"engines": engines, "tasks": tasks, "out_path": args.out}
+    if args.batch_sizes:
+        kwargs["batch_sizes"] = tuple(int(x) for x in args.batch_sizes.split(","))
+
+    print(f"wrote {run(**kwargs)}")

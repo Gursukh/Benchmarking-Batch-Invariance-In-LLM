@@ -5,23 +5,27 @@ import gc
 import torch
 from vllm import LLM, SamplingParams
 
-from batch_invariance_bench.engine import Engine
+from batch_invariance_bench.engine import Engine, Sample
 
 
 DEFAULT_SAMPLING: dict = {
     "temperature": 0,
-    "top_p": 0.95,
     "max_tokens": 2048,
+    "logprobs": 1,
 }
 
 
 class VLLMBase(Engine):
-    """Shared vLLM plumbing. Subclass to toggle batch-invariance modes."""
+    """Common vLLM setup. Subclass to swap models or batch-invariance modes."""
 
     hf_id: str = "Qwen/Qwen3-0.6B"
     dtype: str = "bfloat16"
     max_model_len: int = 4096
-    vllm_kwargs: dict = {}
+    vllm_kwargs: dict = {
+        "enforce_eager": True,
+        "enable_prefix_caching": False,
+        "enable_chunked_prefill": False,
+    }
 
     default_sampling: dict = DEFAULT_SAMPLING
 
@@ -42,11 +46,41 @@ class VLLMBase(Engine):
         prompts: list[str],
         n: int,
         sampling: dict | None = None,
-    ) -> list[list[str]]:
+    ) -> list[list[Sample]]:
         assert self._llm is not None, "call setup() first"
         params = SamplingParams(n=n, **{**self.default_sampling, **(sampling or {})})
         outputs = self._llm.generate(prompts, params, use_tqdm=False)
-        return [[o.text for o in req.outputs] for req in outputs]
+
+        result: list[list[Sample]] = []
+        for req in outputs:
+            n_prompt_tokens = len(req.prompt_token_ids) if req.prompt_token_ids is not None else 0
+            samples: list[Sample] = []
+            for comp in req.outputs:
+                token_ids = list(comp.token_ids)
+                # vLLM gives us logprobs as list[dict[token_id -> Logprob]]; pull
+                # out the chosen token's logprob at each step. NaN if missing.
+                if comp.logprobs is not None:
+                    logprobs = [
+                        float(step_lp[tok].logprob)
+                        if step_lp is not None and tok in step_lp
+                        else float("nan")
+                        for tok, step_lp in zip(token_ids, comp.logprobs)
+                    ]
+                else:
+                    logprobs = [float("nan")] * len(token_ids)
+                samples.append(
+                    Sample(
+                        text=comp.text,
+                        token_ids=token_ids,
+                        logprobs=logprobs,
+                        n_prompt_tokens=n_prompt_tokens,
+                        n_output_tokens=len(token_ids),
+                        finish_reason=str(comp.finish_reason or ""),
+                        stop_reason=str(comp.stop_reason) if comp.stop_reason is not None else "",
+                    )
+                )
+            result.append(samples)
+        return result
 
     def teardown(self) -> None:
         del self._llm

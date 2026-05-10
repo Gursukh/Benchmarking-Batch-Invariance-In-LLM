@@ -13,9 +13,6 @@ dependencies = [
     "transformers",
     "datasets",
     "pandas",
-    "nltk",
-    "immutabledict",
-    "langdetect",
 ]
 
 [tool.setuptools.packages.find]
