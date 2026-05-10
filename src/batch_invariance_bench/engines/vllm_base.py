@@ -11,7 +11,7 @@ from batch_invariance_bench.engine import Engine, Sample
 
 DEFAULT_SAMPLING: dict = {
     "temperature": 0,
-    "max_tokens": 2048,
+    "max_tokens": 4096,
     "logprobs": 1,
 }
 
@@ -21,7 +21,7 @@ class VLLMBase(Engine):
 
     hf_id: str = "Qwen/Qwen3-0.6B"
     dtype: str = "bfloat16"
-    max_model_len: int = 4096
+    max_model_len: int = 8192
     vllm_kwargs: dict = {
         "enforce_eager": True,
         "enable_prefix_caching": False,
