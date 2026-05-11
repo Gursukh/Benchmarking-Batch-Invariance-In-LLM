@@ -13,6 +13,13 @@ dependencies = [
     "transformers",
     "datasets",
     "pandas",
+    "httpx",
+    "nvidia-ml-py",
+]
+
+[project.optional-dependencies]
+perf = [
+    "llmperf @ git+https://github.com/ray-project/llmperf.git@main",
 ]
 
 [tool.setuptools.packages.find]
