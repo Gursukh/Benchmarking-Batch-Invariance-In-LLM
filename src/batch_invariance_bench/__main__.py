@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 
 from batch_invariance_bench.engines.vllm_default import VLLMDefault
+from batch_invariance_bench.engines.vllm_fxpr import VLLMFxpr
 from batch_invariance_bench.engines.vllm_tm_batch_invariant import VLLMTMBatchInvariant
 from batch_invariance_bench.runner import run
 from batch_invariance_bench.tasks import AIME, IFEval, MATH500
@@ -13,6 +14,7 @@ from batch_invariance_bench.tasks import AIME, IFEval, MATH500
 engines = [
     VLLMDefault(),
     VLLMTMBatchInvariant(),
+    VLLMFxpr(),
 ]
 
 
