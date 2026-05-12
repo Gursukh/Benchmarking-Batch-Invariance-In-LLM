@@ -23,9 +23,7 @@ class VLLMBase(Engine):
     dtype: str = "bfloat16"
     max_model_len: int = 4096
     vllm_kwargs: dict = {
-        "enforce_eager": True,
         "enable_prefix_caching": False,
-        "enable_chunked_prefill": False,
     }
 
     chat_template_kwargs: dict = {"enable_thinking": False}
