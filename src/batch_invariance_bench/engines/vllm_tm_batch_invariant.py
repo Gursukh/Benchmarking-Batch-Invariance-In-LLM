@@ -7,8 +7,6 @@ from batch_invariance_bench.engines.vllm_base import VLLMBase
 
 class VLLMTMBatchInvariant(VLLMBase):
     """vLLM with Thinking Machines' batch-invariant ops turned on.
-
-    Activated via the VLLM_BATCH_INVARIANT=1 env var. See
     https://github.com/thinking-machines-lab/batch_invariant_ops.
     """
 

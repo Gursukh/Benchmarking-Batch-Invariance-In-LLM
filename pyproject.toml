@@ -8,13 +8,19 @@ version = "0.1.0"
 description = "Benchmark harness for measuring variance from batch-invariance solutions in vLLM."
 requires-python = ">=3.10"
 dependencies = [
-    "vllm",
+    # vllm >= 0.10 for Qwen3 support + the VLLM_BATCH_INVARIANT env var
+    "vllm>=0.10",
     "torch",
     "transformers",
     "datasets",
     "pandas",
     "httpx",
     "nvidia-ml-py",
+    # pyairports: vLLM's outlines dep imports `pyairports.airports.AIRPORT_LIST`,
+    # but the real pyairports has been removed from PyPI and only an empty
+    # 0.0.1 squatter remains. Use the inline shim from PERF.md "Colab gotchas"
+    # to satisfy the import. We don't use guided decoding, so an empty list works.
+    "math-verify",
 ]
 
 [project.optional-dependencies]
