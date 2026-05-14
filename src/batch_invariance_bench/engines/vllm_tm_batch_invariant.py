@@ -10,8 +10,12 @@ class VLLMTMBatchInvariant(VLLMBase):
     https://github.com/thinking-machines-lab/batch_invariant_ops.
     """
 
-    def __init__(self, name: str | None = None) -> None:
-        super().__init__(name=name)
+    def __init__(
+        self,
+        name: str | None = None,
+        vllm_kwargs: dict | None = None,
+    ) -> None:
+        super().__init__(name=name, vllm_kwargs=vllm_kwargs)
         self._prev_env: str | None = None
 
     def setup(self) -> None:

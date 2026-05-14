@@ -31,6 +31,14 @@ perf = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.uv]
+# llmperf pins pydantic<2.5, but vllm>=0.10 needs pydantic>=2.10. We invoke
+# llmperf as a subprocess (see perf/llmperf_runner.py) and don't import it,
+# so override its pydantic pin to let both coexist in one environment.
+override-dependencies = [
+    "pydantic>=2.10",
+]
+
 [dependency-groups]
 dev = [
     "ruff>=0.15.12",

@@ -30,10 +30,16 @@ class VLLMBase(Engine):
 
     default_sampling: dict = DEFAULT_SAMPLING
 
-    def __init__(self, name: str | None = None) -> None:
+    def __init__(
+        self,
+        name: str | None = None,
+        vllm_kwargs: dict | None = None,
+    ) -> None:
         self.name = name or f"{type(self).__name__}::{self.hf_id}"
         self._llm: LLM | None = None
         self._tokenizer = None
+        # Per-instance override that wins over the class default.
+        self.vllm_kwargs = {**type(self).vllm_kwargs, **(vllm_kwargs or {})}
 
     def setup(self) -> None:
         self._tokenizer = AutoTokenizer.from_pretrained(self.hf_id)
