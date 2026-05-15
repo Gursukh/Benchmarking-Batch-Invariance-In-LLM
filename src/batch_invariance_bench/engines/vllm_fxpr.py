@@ -22,8 +22,9 @@ class VLLMFxpr(VLLMBase):
         fxp_int_bits: int | None = None,
         fxp_frac_bits: int | None = None,
         vllm_kwargs: dict | None = None,
+        sampling: dict | None = None,
     ) -> None:
-        super().__init__(name=name, vllm_kwargs=vllm_kwargs)
+        super().__init__(name=name, vllm_kwargs=vllm_kwargs, sampling=sampling)
         if quantization is not None:
             self.quantization = quantization
         if attention_backend is not None:
