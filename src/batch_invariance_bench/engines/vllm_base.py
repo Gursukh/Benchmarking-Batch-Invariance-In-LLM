@@ -45,12 +45,14 @@ class VLLMBase(Engine):
 
     def setup(self) -> None:
         self._tokenizer = AutoTokenizer.from_pretrained(self.hf_id)
-        self._llm = LLM(
-            model=self.hf_id,
-            dtype=self.dtype,
-            max_model_len=self.max_model_len,
+        # vllm_kwargs wins over the defaults so callers can override anything.
+        llm_kwargs = {
+            "model": self.hf_id,
+            "dtype": self.dtype,
+            "max_model_len": self.max_model_len,
             **self.vllm_kwargs,
-        )
+        }
+        self._llm = LLM(**llm_kwargs)
 
     def _apply_chat_template(self, prompt: str) -> str:
         return self._tokenizer.apply_chat_template(
