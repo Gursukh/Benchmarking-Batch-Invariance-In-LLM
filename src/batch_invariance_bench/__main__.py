@@ -36,11 +36,22 @@ if __name__ == "__main__":
         default=None,
         help="Comma-separated batch sizes (e.g. '1,2,4'). Default: 1,2,4,6,8,16.",
     )
+    parser.add_argument(
+        "--stop-on-divergence",
+        action="store_true",
+        help="Stop an (engine, task) sweep as soon as one prompt's tokens or "
+        "logits differ from the first batch size.",
+    )
     args = parser.parse_args()
 
     tasks = [MATH500(limit=args.limit), AIME(limit=args.limit), IFEval(limit=args.limit)]
 
-    kwargs: dict = {"engines": engines, "tasks": tasks, "out_path": args.out}
+    kwargs: dict = {
+        "engines": engines,
+        "tasks": tasks,
+        "out_path": args.out,
+        "stop_on_divergence": args.stop_on_divergence,
+    }
     if args.batch_sizes:
         kwargs["batch_sizes"] = tuple(int(x) for x in args.batch_sizes.split(","))
 

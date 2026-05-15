@@ -27,6 +27,17 @@ def _now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
 
 
+def _diverges(ref: Sample, other: Sample) -> bool:
+    """True if `other` has different tokens or logits than the reference."""
+    if ref.token_ids != other.token_ids:
+        return True
+    for a, b in zip(ref.logprobs, other.logprobs):
+        # NaN == NaN should count as equal (missing logprob, not divergence).
+        if a != b and not (a != a and b != b):
+            return True
+    return False
+
+
 def run(
     engines: Sequence[Engine],
     tasks: Sequence[Task],
@@ -34,11 +45,16 @@ def run(
     n: int = 1,
     sampling: dict | None = None,
     out_path: str | Path | None = None,
+    stop_on_divergence: bool = False,
 ) -> Path:
     """Run every (engine, task, batch_size) combination and dump raw outputs.
 
     The engine is rebuilt between batch sizes so KV cache and compiled-graph
     state can't leak across the sweep. Scoring is intentionally not done here.
+
+    If `stop_on_divergence` is set, the first batch size is kept as a reference
+    and the sweep for an (engine, task) pair is abandoned as soon as any prompt
+    produces tokens or logits that differ from that reference.
     """
     out_dir = Path(out_path) if out_path else default_output_path().parent
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -59,7 +75,13 @@ def run(
                 / f"{_slug(gpu_name)}.{_slug(engine.name)}.{_slug(task.name)}.csv"
             )
 
-            for bs in batch_sizes:
+            # Reference outputs from the first batch size, keyed by
+            # (problem_id, sample_idx). Only populated when stopping early.
+            reference: dict[tuple[str, int], Sample] = {}
+
+            for bs_i, bs in enumerate(batch_sizes):
+                is_reference = bs_i == 0
+                divergence: str | None = None
                 t0 = time.perf_counter()
                 print(f"[{engine.name} | {task.name} | bs={bs}] setup...", flush=True)
                 engine.setup()
@@ -96,20 +118,51 @@ def run(
                                     sample_idx=sample_idx,
                                     sample=s,
                                 ))
+                                if stop_on_divergence:
+                                    key = (str(item["id"]), sample_idx)
+                                    if is_reference:
+                                        reference[key] = s
+                                    elif key in reference and _diverges(
+                                        reference[key], s
+                                    ):
+                                        divergence = (
+                                            f"problem={key[0]} sample={key[1]} "
+                                            f"bs={bs} vs reference bs={batch_sizes[0]}"
+                                        )
                             idx += 1
                             print(f"\r  [{idx}/{total}]", end="", flush=True)
+                            if divergence is not None:
+                                break
                         append_rows(task_out, rows)
-                    print(
-                        f"\r[{engine.name} | {task.name} | bs={bs}] done "
-                        f"{total}/{total} ({time.perf_counter() - t_bs:.1f}s)",
-                        flush=True,
-                    )
+                        if divergence is not None:
+                            break
+                    if divergence is not None:
+                        print(
+                            f"\r[{engine.name} | {task.name} | bs={bs}] "
+                            f"divergence detected ({divergence}) "
+                            f"({time.perf_counter() - t_bs:.1f}s)",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"\r[{engine.name} | {task.name} | bs={bs}] done "
+                            f"{total}/{total} ({time.perf_counter() - t_bs:.1f}s)",
+                            flush=True,
+                        )
                 finally:
                     engine.teardown()
                     print(
                         f"[{engine.name} | {task.name} | bs={bs}] teardown",
                         flush=True,
                     )
+
+                if divergence is not None:
+                    print(
+                        f"[{engine.name} | {task.name}] stopping sweep early "
+                        f"after divergence",
+                        flush=True,
+                    )
+                    break
 
     return out_dir
 
