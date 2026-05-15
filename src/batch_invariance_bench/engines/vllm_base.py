@@ -34,12 +34,14 @@ class VLLMBase(Engine):
         self,
         name: str | None = None,
         vllm_kwargs: dict | None = None,
+        sampling: dict | None = None,
     ) -> None:
         self.name = name or f"{type(self).__name__}::{self.hf_id}"
         self._llm: LLM | None = None
         self._tokenizer = None
-        # Per-instance override that wins over the class default.
+        # Per-instance overrides that win over the class defaults.
         self.vllm_kwargs = {**type(self).vllm_kwargs, **(vllm_kwargs or {})}
+        self.default_sampling = {**type(self).default_sampling, **(sampling or {})}
 
     def setup(self) -> None:
         self._tokenizer = AutoTokenizer.from_pretrained(self.hf_id)
