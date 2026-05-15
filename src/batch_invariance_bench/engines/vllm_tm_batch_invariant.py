@@ -14,8 +14,9 @@ class VLLMTMBatchInvariant(VLLMBase):
         self,
         name: str | None = None,
         vllm_kwargs: dict | None = None,
+        sampling: dict | None = None,
     ) -> None:
-        super().__init__(name=name, vllm_kwargs=vllm_kwargs)
+        super().__init__(name=name, vllm_kwargs=vllm_kwargs, sampling=sampling)
         self._prev_env: str | None = None
 
     def setup(self) -> None:
