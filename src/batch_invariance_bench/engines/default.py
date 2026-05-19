@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from batch_invariance_bench.engines.vllm_base import VLLMBase
+from batch_invariance_bench.engines.base import VLLMBase
 
 
 class VLLMDefault(VLLMBase):
     """Stock vLLM with no batch-invariance patches applied."""
+
+    label = "Default"
 
 
 # Example of swapping in a different model:

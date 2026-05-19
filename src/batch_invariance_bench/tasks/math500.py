@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from datasets import load_dataset
+from typing import TYPE_CHECKING
 
-from batch_invariance_bench.tasks.base import Item, Task
+from batch_invariance_bench.tasks.base import HFTask, Item
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 
 PROMPT_TEMPLATE = (
@@ -11,24 +14,23 @@ PROMPT_TEMPLATE = (
 )
 
 
-class MATH500(Task):
+class MATH500(HFTask):
     name = "math500"
+    hf_dataset = "HuggingFaceH4/MATH-500"
+    default_split = "test"
 
-    def __init__(self, split: str = "test", limit: int | None = None) -> None:
-        self._split = split
-        self._limit = limit
+    def _to_item(self, row: dict, idx: int) -> Item:
+        return Item(
+            id=str(row.get("unique_id", row.get("problem", "")[:64])),
+            prompt=PROMPT_TEMPLATE.format(problem=row["problem"]),
+            reference=row["answer"],
+        )
 
-    def load(self) -> list[Item]:
-        ds = load_dataset("HuggingFaceH4/MATH-500", split=self._split)
-        if self._limit:
-            ds = ds.select(range(min(self._limit, len(ds))))
-        items: list[Item] = []
-        for row in ds:
-            items.append(
-                Item(
-                    id=str(row.get("unique_id", row.get("problem")[:64])),
-                    prompt=PROMPT_TEMPLATE.format(problem=row["problem"]),
-                    reference=row["answer"],
-                )
-            )
-        return items
+    def score(self, df: "pd.DataFrame") -> "pd.DataFrame":
+        from batch_invariance_bench.correctness.score import score_frame
+
+        return score_frame(df, references=self.references())
+
+    def references(self) -> dict[str, str]:
+        """Map of problem_id to answer for this split."""
+        return {it["id"]: str(it["reference"]) for it in self.load()}

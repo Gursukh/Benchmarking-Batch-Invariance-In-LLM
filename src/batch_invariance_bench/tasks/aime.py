@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from datasets import load_dataset
+from typing import TYPE_CHECKING
 
-from batch_invariance_bench.tasks.base import Item, Task
+from batch_invariance_bench.tasks.base import HFTask, Item
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 
 PROMPT_TEMPLATE = (
@@ -12,38 +15,31 @@ PROMPT_TEMPLATE = (
 )
 
 
-class AIME(Task):
+class AIME(HFTask):
     """AIME problems. Answers are non-negative integers in [0, 999]."""
 
     name = "aime"
+    hf_dataset = "Maxwell-Jia/AIME_2024"
+    default_split = "train"
 
-    def __init__(
-        self,
-        hf_dataset: str = "Maxwell-Jia/AIME_2024",
-        split: str = "train",
-        problem_field: str = "Problem",
-        answer_field: str = "Answer",
-        id_field: str = "ID",
-        limit: int | None = None,
-    ) -> None:
-        self._hf_dataset = hf_dataset
-        self._split = split
-        self._problem_field = problem_field
-        self._answer_field = answer_field
-        self._id_field = id_field
-        self._limit = limit
+    # Dataset field names; override in a subclass for a different source.
+    problem_field = "Problem"
+    answer_field = "Answer"
+    id_field = "ID"
 
-    def load(self) -> list[Item]:
-        ds = load_dataset(self._hf_dataset, split=self._split)
-        if self._limit:
-            ds = ds.select(range(min(self._limit, len(ds))))
-        items: list[Item] = []
-        for i, row in enumerate(ds):
-            items.append(
-                Item(
-                    id=str(row.get(self._id_field, i)),
-                    prompt=PROMPT_TEMPLATE.format(problem=row[self._problem_field]),
-                    reference=int(row[self._answer_field]),
-                )
-            )
-        return items
+    def _to_item(self, row: dict, idx: int) -> Item:
+        return Item(
+            id=str(row.get(self.id_field, idx)),
+            prompt=PROMPT_TEMPLATE.format(problem=row[self.problem_field]),
+            reference=int(row[self.answer_field]),
+        )
+
+    def score(self, df: "pd.DataFrame") -> "pd.DataFrame":
+        # AIME answers are integers, so the boxed-answer scorer handles them.
+        from batch_invariance_bench.correctness.score import score_frame
+
+        return score_frame(df, references=self.references())
+
+    def references(self) -> dict[str, str]:
+        """Map of problem_id to answer for this split."""
+        return {it["id"]: str(it["reference"]) for it in self.load()}

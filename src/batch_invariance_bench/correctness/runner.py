@@ -1,20 +1,20 @@
 from __future__ import annotations
 
-import datetime as _dt
 import json
 import time
 import uuid
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from batch_invariance_bench.engine import Engine, Sample
-from batch_invariance_bench.io import (
-    _slug,
-    append_rows,
-    default_output_path,
-    gpu_info,
-    vllm_version,
+from batch_invariance_bench.common.csvio import (
+    append_csv_rows,
+    default_output_dir,
+    now,
+    slug,
 )
+from batch_invariance_bench.common.gpu import gpu_info, vllm_version
+from batch_invariance_bench.correctness.schema import OUTPUT_COLUMNS
+from batch_invariance_bench.engines.base import Engine, Sample
 from batch_invariance_bench.tasks.base import Item, Task
 
 
@@ -23,16 +23,15 @@ def _chunked(seq: Sequence[Item], size: int) -> Iterable[Sequence[Item]]:
         yield seq[i : i + size]
 
 
-def _now() -> str:
-    return _dt.datetime.now(_dt.timezone.utc).isoformat()
-
-
 def _diverges(ref: Sample, other: Sample) -> bool:
-    """True if `other` has different tokens or logits than the reference."""
+    """True if `other` has different tokens or logprobs than the reference.
+
+    A NaN against a real value counts as divergence. Two NaNs at the same step
+    do not, since a missing logprob is not a real mismatch.
+    """
     if ref.token_ids != other.token_ids:
         return True
     for a, b in zip(ref.logprobs, other.logprobs):
-        # NaN == NaN should count as equal (missing logprob, not divergence).
         if a != b and not (a != a and b != b):
             return True
     return False
@@ -47,17 +46,18 @@ def run(
     out_path: str | Path | None = None,
     stop_on_divergence: bool = False,
 ) -> Path:
-    """Run every (engine, task, batch_size) combination and dump raw outputs.
+    """Run every (engine, task, batch_size) combo and dump the raw outputs.
 
     The engine is rebuilt between batch sizes so KV cache and compiled-graph
-    state can't leak across the sweep. Scoring is intentionally not done here.
+    state cannot leak across the sweep. Scoring is left to the caller.
 
-    If `stop_on_divergence` is set, the first batch size is kept as a reference
-    and the sweep for an (engine, task) pair is abandoned as soon as any prompt
-    produces tokens or logits that differ from that reference.
+    Each (engine, task) pair writes one CSV named with the run id, so re-runs
+    never append into an older run's file.
+
+    With stop_on_divergence, the first batch size is the reference and the
+    sweep for that (engine, task) stops once any prompt's output differs.
     """
-    out_dir = Path(out_path) if out_path else default_output_path().parent
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = default_output_dir(out_path) if out_path else default_output_dir()
     run_id = uuid.uuid4().hex[:12]
     arch, gpu_name = gpu_info()
     vllm_v = vllm_version()
@@ -72,21 +72,21 @@ def run(
             items = task.load()
             task_out = (
                 out_dir
-                / f"{_slug(gpu_name)}.{_slug(engine.name)}.{_slug(task.name)}.csv"
+                / f"{slug(gpu_name)}.{run_id}.{slug(engine.key)}.{slug(task.name)}.csv"
             )
 
-            # Reference outputs from the first batch size, keyed by
-            # (problem_id, sample_idx). Only populated when stopping early.
+            # First batch size's outputs, keyed (problem_id, sample_idx).
+            # Only filled when stopping early.
             reference: dict[tuple[str, int], Sample] = {}
 
             for bs_i, bs in enumerate(batch_sizes):
                 is_reference = bs_i == 0
                 divergence: str | None = None
                 t0 = time.perf_counter()
-                print(f"[{engine.name} | {task.name} | bs={bs}] setup...", flush=True)
+                print(f"[{engine.key} | {task.name} | bs={bs}] setup...", flush=True)
                 engine.setup()
                 print(
-                    f"[{engine.name} | {task.name} | bs={bs}] ready "
+                    f"[{engine.key} | {task.name} | bs={bs}] ready "
                     f"({time.perf_counter() - t0:.1f}s)",
                     flush=True,
                 )
@@ -95,29 +95,29 @@ def run(
                     idx = 0
                     t_bs = time.perf_counter()
                     print(
-                        f"[{engine.name} | {task.name} | bs={bs}] {total} items",
+                        f"[{engine.key} | {task.name} | bs={bs}] {total} items",
                         flush=True,
                     )
                     for batch in _chunked(items, bs):
                         prompts = [it["prompt"] for it in batch]
-                        completions = engine.generate(
-                            prompts, n=n, sampling=sampling
-                        )
+                        completions = engine.generate(prompts, n=n, sampling=sampling)
                         rows = []
                         for item, samples in zip(batch, completions):
                             for sample_idx, s in enumerate(samples):
-                                rows.append(_row(
-                                    run_id=run_id,
-                                    arch=arch,
-                                    gpu_name=gpu_name,
-                                    engine_name=engine.name,
-                                    vllm_v=vllm_v,
-                                    task_name=task.name,
-                                    problem_id=str(item["id"]),
-                                    bs=bs,
-                                    sample_idx=sample_idx,
-                                    sample=s,
-                                ))
+                                rows.append(
+                                    _row(
+                                        run_id=run_id,
+                                        arch=arch,
+                                        gpu_name=gpu_name,
+                                        engine_name=engine.key,
+                                        vllm_v=vllm_v,
+                                        task_name=task.name,
+                                        problem_id=str(item["id"]),
+                                        bs=bs,
+                                        sample_idx=sample_idx,
+                                        sample=s,
+                                    )
+                                )
                                 if stop_on_divergence:
                                     key = (str(item["id"]), sample_idx)
                                     if is_reference:
@@ -133,32 +133,32 @@ def run(
                             print(f"\r  [{idx}/{total}]", end="", flush=True)
                             if divergence is not None:
                                 break
-                        append_rows(task_out, rows)
+                        append_csv_rows(task_out, rows, OUTPUT_COLUMNS)
                         if divergence is not None:
                             break
                     if divergence is not None:
                         print(
-                            f"\r[{engine.name} | {task.name} | bs={bs}] "
+                            f"\r[{engine.key} | {task.name} | bs={bs}] "
                             f"divergence detected ({divergence}) "
                             f"({time.perf_counter() - t_bs:.1f}s)",
                             flush=True,
                         )
                     else:
                         print(
-                            f"\r[{engine.name} | {task.name} | bs={bs}] done "
+                            f"\r[{engine.key} | {task.name} | bs={bs}] done "
                             f"{total}/{total} ({time.perf_counter() - t_bs:.1f}s)",
                             flush=True,
                         )
                 finally:
                     engine.teardown()
                     print(
-                        f"[{engine.name} | {task.name} | bs={bs}] teardown",
+                        f"[{engine.key} | {task.name} | bs={bs}] teardown",
                         flush=True,
                     )
 
                 if divergence is not None:
                     print(
-                        f"[{engine.name} | {task.name}] stopping sweep early "
+                        f"[{engine.key} | {task.name}] stopping sweep early "
                         f"after divergence",
                         flush=True,
                     )
@@ -197,5 +197,5 @@ def _row(
         "n_output_tokens": sample.n_output_tokens,
         "finish_reason": sample.finish_reason,
         "stop_reason": sample.stop_reason,
-        "timestamp": _now(),
+        "timestamp": now(),
     }

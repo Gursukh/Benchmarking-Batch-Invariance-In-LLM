@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-import os
+from batch_invariance_bench.common.env import apply_env, restore_env
+from batch_invariance_bench.engines.base import VLLMBase
 
-from batch_invariance_bench.engines.vllm_base import VLLMBase
+
+# vLLM plugin name. The matching entry point in pyproject.toml runs
+# fxpr_vllm.register() in any vLLM process whose VLLM_PLUGINS lists it.
+FXPR_PLUGIN = "fxpr"
 
 
 class VLLMFxpr(VLLMBase):
     """vLLM with fxpr_vllm fixed-point-reduction kernels."""
+
+    label = "FXPR"
 
     quantization: str | None = "fixed_point_det"
     attention_backend: str | None = "CUSTOM"
@@ -35,33 +41,50 @@ class VLLMFxpr(VLLMBase):
             self.fxp_frac_bits = fxp_frac_bits
         self._prev_env: dict[str, str | None] = {}
 
+    def _fxp_env(self) -> dict[str, str]:
+        """fxpr kernel bit-width env, read at registration time."""
+        return {
+            "VLLM_FXP_INT_BITS": str(self.fxp_int_bits),
+            "VLLM_FXP_FRAC_BITS": str(self.fxp_frac_bits),
+        }
+
     def setup(self) -> None:
-        # Save existing env so teardown can restore it exactly.
-        for key in ("VLLM_FXP_INT_BITS", "VLLM_FXP_FRAC_BITS"):
-            self._prev_env[key] = os.environ.get(key)
-        os.environ["VLLM_FXP_INT_BITS"] = str(self.fxp_int_bits)
-        os.environ["VLLM_FXP_FRAC_BITS"] = str(self.fxp_frac_bits)
+        # In-process: set the bit-width env, then register fxpr's kernels.
+        # The server path does this through the `fxpr` plugin instead.
+        self._prev_env = apply_env(self._fxp_env())
 
         from fxpr_vllm.register import register
 
         register()
+        super().setup()
 
+    def _extra_vllm_kwargs(self) -> dict:
         extra: dict = {}
         if self.quantization is not None:
             extra["quantization"] = self.quantization
         if self.attention_backend is not None:
             extra["attention_backend"] = self.attention_backend
-        self.vllm_kwargs = {**self.vllm_kwargs, **extra}
+        return extra
 
-        super().setup()
+    def _server_env(self) -> dict[str, str]:
+        return self._fxp_env()
+
+    def _server_cli(self) -> list[str]:
+        cli: list[str] = []
+        if self.quantization is not None:
+            cli += ["--quantization", self.quantization]
+        if self.attention_backend is not None:
+            cli += ["--attention-backend", self.attention_backend]
+        return cli
+
+    def _server_plugins(self) -> list[str]:
+        # Without this plugin the server never runs fxpr_vllm.register() and
+        # silently falls back to stock vLLM kernels. See _fxpr_plugin.py.
+        return [FXPR_PLUGIN]
 
     def teardown(self) -> None:
         try:
             super().teardown()
         finally:
-            for key, prev in self._prev_env.items():
-                if prev is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = prev
+            restore_env(self._prev_env)
             self._prev_env = {}

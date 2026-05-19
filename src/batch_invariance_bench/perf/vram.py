@@ -1,94 +1,116 @@
+"""GPU memory sampling for the perf harness."""
+
 from __future__ import annotations
 
-import csv
-import datetime as _dt
-import threading
-import time
+import os
 import warnings
 from pathlib import Path
 
+from batch_invariance_bench.common.sampling import BackgroundSampler
 
-class VRAMSampler:
-    """Context-manager that polls NVML at a fixed Hz on a background thread.
-    `peak_mb` / `mean_mb` return nan if NVML isn't usable."""
+
+class VRAMSampler(BackgroundSampler):
+    """Polls NVML and records the GPU memory held by the server's process group.
+
+    proc_* come from per-process NVML accounting for the server's pgid (every
+    vLLM worker shares it). If that is not available (old driver, MIG, missing
+    permissions) the sample falls back to whole-device usage and vram_source
+    reports "device_fallback" instead of "per_process". The *_mb properties
+    return nan when NVML itself is unusable.
+    """
+
+    csv_header = ("proc_used_mb", "device_used_mb", "device_total_mb")
 
     def __init__(
         self,
+        server_pgid: int | None = None,
         device_index: int = 0,
         hz: float = 5.0,
         out_csv: Path | None = None,
     ) -> None:
+        super().__init__(hz=hz, out_csv=out_csv)
+        self.server_pgid = server_pgid
         self.device_index = device_index
-        self.hz = hz
-        self.out_csv = out_csv
-        self._samples: list[tuple[float, float]] = []   # (ts, used_mb)
-        self._thread: threading.Thread | None = None
-        self._stop = threading.Event()
         self._handle = None
         self._nvml = None
-        self._writer = None
-        self._fp = None
-        self._available = False
+        self._per_process_ok = False
 
-    def __enter__(self) -> "VRAMSampler":
+    def _open(self) -> bool:
         try:
             import pynvml
+
             pynvml.nvmlInit()
             self._handle = pynvml.nvmlDeviceGetHandleByIndex(self.device_index)
             self._nvml = pynvml
-            self._available = True
+            return True
         except Exception as e:
             warnings.warn(f"VRAM sampling disabled: {e}", stacklevel=2)
-            return self
+            return False
 
-        if self.out_csv is not None:
-            self.out_csv.parent.mkdir(parents=True, exist_ok=True)
-            self._fp = self.out_csv.open("w", newline="")
-            self._writer = csv.writer(self._fp)
-            self._writer.writerow(["timestamp_iso", "used_mb", "free_mb", "total_mb"])
-
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
+    def _close(self) -> None:
         if self._nvml is not None:
-            try:
-                self._nvml.nvmlShutdown()
-            except Exception:
-                pass
-        if self._fp is not None:
-            self._fp.close()
+            self._nvml.nvmlShutdown()
 
-    def _loop(self) -> None:
-        period = 1.0 / max(self.hz, 0.1)
-        while not self._stop.is_set():
+    def _proc_used_mb(self) -> float | None:
+        """GPU memory held by the server's process group.
+
+        None when per-process accounting is not available this sample.
+        """
+        if self.server_pgid is None:
+            return None
+        try:
+            procs = self._nvml.nvmlDeviceGetComputeRunningProcesses(self._handle)
+        except Exception:
+            return None
+        total = 0
+        matched = False
+        for p in procs:
             try:
-                info = self._nvml.nvmlDeviceGetMemoryInfo(self._handle)
-                used_mb  = info.used  / (1024 ** 2)
-                free_mb  = info.free  / (1024 ** 2)
-                total_mb = info.total / (1024 ** 2)
-                ts = time.time()
-                self._samples.append((ts, used_mb))
-                if self._writer is not None:
-                    iso = _dt.datetime.fromtimestamp(ts, _dt.timezone.utc).isoformat()
-                    self._writer.writerow([iso, f"{used_mb:.2f}", f"{free_mb:.2f}", f"{total_mb:.2f}"])
-                    self._fp.flush()
-            except Exception:
-                pass
-            self._stop.wait(period)
+                if os.getpgid(p.pid) != self.server_pgid:
+                    continue
+            except (ProcessLookupError, PermissionError):
+                continue
+            used = getattr(p, "usedGpuMemory", None)
+            if used is None:
+                continue
+            total += used
+            matched = True
+        if not matched:
+            return None
+        return total / (1024**2)
+
+    def _sample(self) -> tuple | None:
+        info = self._nvml.nvmlDeviceGetMemoryInfo(self._handle)
+        device_used_mb = info.used / (1024**2)
+        device_total_mb = info.total / (1024**2)
+        proc_mb = self._proc_used_mb()
+        if proc_mb is not None:
+            self._per_process_ok = True
+        # fall back to device usage when per-process is unavailable
+        proc_used_mb = proc_mb if proc_mb is not None else device_used_mb
+        return (proc_used_mb, device_used_mb, device_total_mb)
+
+    def _format(self, values: tuple) -> list[str]:
+        return [f"{v:.2f}" for v in values]
+
+    # summary properties; each sample is (ts, proc_used, device_used, device_total)
+    @property
+    def vram_source(self) -> str:
+        if not self._samples:
+            return ""
+        return "per_process" if self._per_process_ok else "device_fallback"
 
     @property
-    def peak_mb(self) -> float:
-        if not self._samples:
-            return float("nan")
-        return max(s[1] for s in self._samples)
+    def proc_peak_mb(self) -> float:
+        col = self._column(1)
+        return max(col) if col else float("nan")
 
     @property
-    def mean_mb(self) -> float:
-        if not self._samples:
-            return float("nan")
-        return sum(s[1] for s in self._samples) / len(self._samples)
+    def proc_mean_mb(self) -> float:
+        col = self._column(1)
+        return sum(col) / len(col) if col else float("nan")
+
+    @property
+    def device_peak_mb(self) -> float:
+        col = self._column(2)
+        return max(col) if col else float("nan")
