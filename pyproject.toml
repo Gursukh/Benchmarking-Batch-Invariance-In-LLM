@@ -8,8 +8,6 @@ version = "0.1.0"
 description = "Benchmark harness for measuring variance from batch-invariance solutions in vLLM."
 requires-python = ">=3.10"
 dependencies = [
-    # Pinned: scheduler/V1/sampler internals shift across minor vLLM releases,
-    # which would invalidate cross-run comparisons. Bump deliberately.
     "vllm",
     "torch",
     "transformers",
@@ -21,8 +19,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Fixed-point reduction kernels for the VLLMFxpr engine. Optional because not
-# everyone running the benchmark has fxpr_vllm available.
 fxpr = ["fxpr_vllm"]
 
 [tool.setuptools.packages.find]

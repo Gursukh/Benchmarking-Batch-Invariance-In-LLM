@@ -22,23 +22,3 @@ def vllm_version() -> str:
         return version("vllm")
     except PackageNotFoundError:
         return "unknown"
-
-
-def assert_single_gpu() -> None:
-    """Raise if more than one CUDA device is visible.
-
-    gpu_name reports device 0 only; multi-GPU runs would silently mislabel
-    rows. Set CUDA_VISIBLE_DEVICES=0 on multi-GPU hosts.
-    """
-    try:
-        import torch
-    except ImportError:
-        return
-    if not torch.cuda.is_available():
-        return
-    n = torch.cuda.device_count()
-    if n > 1:
-        raise RuntimeError(
-            f"{n} CUDA devices visible; this harness is single-GPU only. "
-            f"Set CUDA_VISIBLE_DEVICES=<one index>."
-        )

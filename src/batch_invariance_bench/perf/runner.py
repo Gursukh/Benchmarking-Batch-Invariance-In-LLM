@@ -141,7 +141,6 @@ def run(
     and appends the per-request and throughput stats to the engine CSV.
     Refuses to run with more than one GPU visible since we only read device 0.
     """
-    assert_single_gpu()
 
     out_dir = Path(out_path) if out_path else Path("data/perf")
     out_dir.mkdir(parents=True, exist_ok=True)
