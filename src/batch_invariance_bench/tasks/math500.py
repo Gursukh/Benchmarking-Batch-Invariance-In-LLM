@@ -32,5 +32,4 @@ class MATH500(HFTask):
         return score_frame(df, references=self.references())
 
     def references(self) -> dict[str, str]:
-        """Map of problem_id to answer for this split."""
         return {it["id"]: str(it["reference"]) for it in self.load()}

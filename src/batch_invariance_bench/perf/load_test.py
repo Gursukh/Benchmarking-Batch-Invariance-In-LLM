@@ -1,31 +1,44 @@
-"""In-house closed-loop load generator.
+"""In-process load generator for offline inference.
 
-Replaces llmperf (unmaintained, Ray-based, Python <3.11 only). Drives a vLLM
-OpenAI server over streaming /v1/completions, keeping `concurrency` requests in
-flight, and returns TTFT, ITL, E2E and throughput in the CSV row schema.
-
-ITL stats pool every inter-token gap of every request, the usual definition.
-Percentiles of per-request mean ITL would hide decode-stall tails.
-
-Prompts are random token ids of a fixed length from a fixed seed, so every
-engine sees the same work.
+Submits all requests at once, then drives engine.step() until they finish.
+We avoid LLM.generate() because vLLM v1 leaves the metrics empty. TTFT is
+reported as prefill only and as submit to first token; ITL is the pooled
+inter token gaps measured at step boundaries.
 """
 
 from __future__ import annotations
 
-import concurrent.futures as cf
-import json
 import random
 import statistics
 import time
+from typing import Sequence
 
-import httpx
+from vllm import LLM, SamplingParams
+from vllm.inputs import TokensPrompt
 
-from batch_invariance_bench.common.sampling import nearest_rank
 
-
-# vocab size per model id, so the tokenizer is not reloaded each cell.
 _VOCAB_CACHE: dict[str, int] = {}
+_CORPUS_CACHE: list[str] | None = None
+
+
+def _nearest_rank(values: Sequence[float], q: float) -> float:
+    vals = [v for v in values if v == v]
+    if not vals:
+        return float("nan")
+    s = sorted(vals)
+    idx = min(len(s) - 1, int(q * (len(s) - 1) + 0.5))
+    return s[idx]
+
+
+def _stat(values: list[float]) -> dict[str, float | None]:
+    if not values:
+        return {"mean": None, "p50": None, "p90": None, "p95": None}
+    return {
+        "mean": statistics.fmean(values),
+        "p50": _nearest_rank(values, 0.50),
+        "p90": _nearest_rank(values, 0.90),
+        "p95": _nearest_rank(values, 0.95),
+    }
 
 
 def _vocab_size(model_id: str) -> int:
@@ -37,152 +50,207 @@ def _vocab_size(model_id: str) -> int:
     return _VOCAB_CACHE[model_id]
 
 
-def _stat(values: list[float]) -> dict[str, float | None]:
-    """mean, p50, p90 and p95 of values. All None if values is empty."""
-    if not values:
-        return {"mean": None, "p50": None, "p90": None, "p95": None}
-    return {
-        "mean": statistics.fmean(values),
-        "p50": nearest_rank(values, 0.50),
-        "p90": nearest_rank(values, 0.90),
-        "p95": nearest_rank(values, 0.95),
-    }
+def _load_corpus() -> list[str]:
+    global _CORPUS_CACHE
+    if _CORPUS_CACHE is not None:
+        return _CORPUS_CACHE
+    from datasets import load_dataset
+
+    ds = load_dataset("HuggingFaceH4/MATH-500", split="test")
+    _CORPUS_CACHE = [str(row["problem"]) for row in ds.select(range(min(200, len(ds))))]
+    return _CORPUS_CACHE
 
 
-def _one_request(
-    client: httpx.Client,
-    url: str,
-    headers: dict[str, str],
-    payload: dict,
-) -> dict:
-    """Run one streaming completion and time it.
+def _encode_prompt(
+    model_id: str,
+    target_len: int,
+    rng: random.Random,
+    use_random_tokens: bool,
+) -> list[int]:
+    if use_random_tokens:
+        vocab = _vocab_size(model_id)
+        return [rng.randrange(vocab) for _ in range(target_len)]
 
-    Never raises; a failure goes in the returned dict's `error` field.
-    itl_gaps_s holds every inter-token gap for the caller to pool.
-    """
-    t_start = time.perf_counter()
-    token_times: list[float] = []
-    error: str | None = None
-    try:
-        with client.stream("POST", url, headers=headers, json=payload) as resp:
-            if resp.status_code != 200:
-                body = resp.read().decode("utf-8", "replace")
-                raise RuntimeError(f"HTTP {resp.status_code}: {body[:300]}")
-            for line in resp.iter_lines():
-                if not line or not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                choices = obj.get("choices") or []
-                # vLLM streams one token per chunk for /v1/completions.
-                if choices and choices[0].get("text"):
-                    token_times.append(time.perf_counter())
-    except Exception as e:
-        error = f"{type(e).__name__}: {e}"
-    t_end = time.perf_counter()
+    from transformers import AutoTokenizer
 
-    n_out = len(token_times)
-    ttft = (token_times[0] - t_start) if token_times else None
-    e2e = (t_end - t_start) if error is None else None
-    # every gap between consecutive streamed tokens
-    itl_gaps = [token_times[i + 1] - token_times[i] for i in range(n_out - 1)]
-    return {
-        "error": error,
-        "ttft_s": ttft,
-        "itl_gaps_s": itl_gaps,
-        "e2e_s": e2e,
-        "n_output_tokens": n_out,
-        "req_output_throughput": (
-            (n_out / e2e) if (error is None and n_out and e2e and e2e > 0) else None
-        ),
-    }
+    tok = AutoTokenizer.from_pretrained(model_id)
+    corpus = _load_corpus()
+    text = corpus[rng.randrange(len(corpus))]
+    ids = tok.encode(text, add_special_tokens=False)
+    if not ids:
+        vocab = _vocab_size(model_id)
+        return [rng.randrange(vocab) for _ in range(target_len)]
+    if len(ids) >= target_len:
+        start = rng.randrange(len(ids) - target_len + 1)
+        return ids[start : start + target_len]
+    out: list[int] = []
+    while len(out) < target_len:
+        out.extend(ids)
+    return out[:target_len]
+
+
+def _build_sampling_params(sampling_params: dict, out_len: int) -> SamplingParams:
+    return SamplingParams(max_tokens=out_len, **sampling_params)
+
+
+def warmup(
+    llm: LLM,
+    model_id: str,
+    n: int,
+    concurrency: int,
+    sampling_params: dict | None = None,
+    seed: int = 0,
+) -> None:
+    """Warmup batch at the target concurrency so kernels are hot."""
+    n = max(n, 2 * concurrency)
+    if n <= 0:
+        return
+    if sampling_params is None:
+        sampling_params = {"ignore_eos": True, "temperature": 0}
+    vocab = _vocab_size(model_id)
+    rng = random.Random(seed)
+    prompts = [
+        TokensPrompt(prompt_token_ids=[rng.randrange(vocab) for _ in range(16)])
+        for _ in range(n)
+    ]
+    params = [_build_sampling_params(sampling_params, 8) for _ in range(n)]
+    llm.generate(prompts, params, use_tqdm=False)
 
 
 def run_load_test(
     *,
+    llm: LLM,
     model_id: str,
-    base_url: str,
-    api_key: str,
     concurrency: int,
     max_requests: int,
     mean_input_tokens: int,
     stddev_input_tokens: int,
     mean_output_tokens: int,
     stddev_output_tokens: int,
-    timeout_s: float,
     sampling_params: dict | None = None,
     seed: int = 0,
+    use_random_tokens: bool = False,
+    target_duration_s: float | None = None,
 ) -> dict:
-    """Closed-loop load test.
+    """Submit up to max_requests and drive engine.step() to completion.
 
-    Keeps `concurrency` streaming requests in flight until `max_requests`
-    finish. Returns a summary dict in the perf-row schema, writes no files.
+    Returns a dict for the perf row schema. With target_duration_s set, stop
+    adding requests once the time budget passes; in flight ones still finish.
     """
     if sampling_params is None:
         sampling_params = {"ignore_eos": True, "temperature": 0}
 
-    vocab = _vocab_size(model_id)
     rng = random.Random(seed)
-    url = f"{base_url}/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-
-    # Build every request up front from the fixed seed.
-    specs: list[dict] = []
-    for _ in range(max_requests):
+    items: list[tuple[str, TokensPrompt, SamplingParams, int]] = []
+    for i in range(max_requests):
         in_len = max(1, int(rng.gauss(mean_input_tokens, stddev_input_tokens)))
         out_len = max(1, int(rng.gauss(mean_output_tokens, stddev_output_tokens)))
-        specs.append(
-            {
-                "model": model_id,
-                **sampling_params,
-                "prompt": [rng.randrange(vocab) for _ in range(in_len)],
-                "max_tokens": out_len,
-                "stream": True,
-            }
-        )
+        token_ids = _encode_prompt(model_id, in_len, rng, use_random_tokens)
+        prompt = TokensPrompt(prompt_token_ids=token_ids)
+        params = _build_sampling_params(sampling_params, out_len)
+        items.append((f"req-{i}", prompt, params, i))
 
-    limits = httpx.Limits(
-        max_connections=concurrency + 8,
-        max_keepalive_connections=concurrency + 8,
-    )
+    engine = llm.llm_engine
+    t_arrival: dict[str, float] = {}
+    t_first_token: dict[str, float] = {}
+    t_finish: dict[str, float] = {}
+    n_output: dict[str, int] = {}
+    arrival_order: dict[str, int] = {}
+    itl_gaps: list[float] = []
+    last_step_emit_t: dict[str, float] = {}
+    submitted: set[str] = set()
+
     t0 = time.perf_counter()
-    with httpx.Client(limits=limits, timeout=httpx.Timeout(timeout_s)) as client:
+    for rid, prompt, params, idx in items:
+        if target_duration_s is not None and time.perf_counter() - t0 > target_duration_s:
+            break
+        engine.add_request(rid, prompt, params)
+        t_arrival[rid] = time.perf_counter()
+        arrival_order[rid] = idx
+        submitted.add(rid)
 
-        def _run(payload: dict) -> dict:
-            return _one_request(client, url, headers, payload)
+    while engine.has_unfinished_requests():
+        step_outputs = engine.step()
+        now = time.perf_counter()
+        for out in step_outputs:
+            rid = out.request_id
+            if out.outputs:
+                new_total = len(out.outputs[0].token_ids)
+                prev_total = n_output.get(rid, 0)
+                delta = new_total - prev_total
+                if delta > 0:
+                    if rid not in t_first_token:
+                        t_first_token[rid] = now
+                    if rid in last_step_emit_t:
+                        itl_gaps.append(now - last_step_emit_t[rid])
+                        itl_gaps.extend([0.0] * (delta - 1))
+                    else:
+                        itl_gaps.extend([0.0] * (delta - 1))
+                    last_step_emit_t[rid] = now
+                    n_output[rid] = new_total
+            if out.finished:
+                t_finish[rid] = now
 
-        with cf.ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
-            results = list(ex.map(_run, specs))
     wall_s = time.perf_counter() - t0
 
-    ok = [r for r in results if r["error"] is None]
-    n_errors = len(results) - len(ok)
-    ttft = _stat([r["ttft_s"] for r in ok if r["ttft_s"] is not None])
-    # pool every inter-token gap from every completed request
-    itl = _stat([gap for r in ok for gap in r["itl_gaps_s"]])
-    e2e = _stat([r["e2e_s"] for r in ok if r["e2e_s"] is not None])
-    req_tps = [
-        r["req_output_throughput"] for r in ok if r["req_output_throughput"] is not None
-    ]
-    total_out = sum(r["n_output_tokens"] for r in ok)
+    ttfts_prefill: list[float] = []
+    ttfts_submit: list[float] = []
+    e2es: list[float] = []
+    req_tps: list[float] = []
+    n_errors = 0
+    n_completed = 0
+    total_out = 0
+    first_err: str | None = None
 
-    if results and not ok:
-        first_err = next(r["error"] for r in results if r["error"])
-        raise RuntimeError(f"every load-test request failed; first error: {first_err}")
+    for rid, _, _, _ in items:
+        if rid not in submitted:
+            continue
+        if rid not in t_finish:
+            n_errors += 1
+            if first_err is None:
+                first_err = f"request {rid} did not finish"
+            continue
+        n_out = n_output.get(rid, 0)
+        if n_out == 0:
+            n_errors += 1
+            if first_err is None:
+                first_err = f"request {rid} produced zero tokens"
+            continue
+        n_completed += 1
+        total_out += n_out
+        e2e = t_finish[rid] - t_arrival[rid]
+        e2es.append(e2e)
+        if rid in t_first_token:
+            stft = t_first_token[rid] - t_arrival[rid]
+            ttfts_submit.append(stft)
+            if arrival_order[rid] < concurrency:
+                ttfts_prefill.append(stft)
+        if e2e > 0:
+            req_tps.append(n_out / e2e)
+
+    if n_completed == 0:
+        raise RuntimeError(
+            f"every offline-inference request failed; first error: {first_err}"
+        )
+
+    ttft = _stat(ttfts_prefill)
+    stft = _stat(ttfts_submit)
+    itl = _stat(itl_gaps)
+    e2e = _stat(e2es)
+    n_total = n_completed + n_errors
 
     return {
-        "num_completed": len(ok),
+        "num_completed": n_completed,
         "num_errors": n_errors,
-        "error_rate": (n_errors / len(results)) if results else 0.0,
+        "error_rate": (n_errors / n_total) if n_total else 0.0,
         "ttft_mean_s": ttft["mean"],
         "ttft_p50_s": ttft["p50"],
         "ttft_p90_s": ttft["p90"],
         "ttft_p95_s": ttft["p95"],
+        "submit_to_first_token_mean_s": stft["mean"],
+        "submit_to_first_token_p50_s": stft["p50"],
+        "submit_to_first_token_p90_s": stft["p90"],
+        "submit_to_first_token_p95_s": stft["p95"],
         "itl_mean_s": itl["mean"],
         "itl_p50_s": itl["p50"],
         "itl_p90_s": itl["p90"],

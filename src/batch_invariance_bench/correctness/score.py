@@ -1,11 +1,9 @@
 """Boxed-answer scoring for the correctness harness.
 
 Reads a results CSV, pulls the answer from the last \\boxed{...} in
-completion_text, joins it to per-problem references by problem_id, and checks
-equivalence with math_verify.
-
-Works for any task with a \\boxed{} answer (MATH-500, AIME). The caller passes
-references; load_references() is a default for the MATH-500 split.
+completion_text, joins to references by problem_id, and checks equivalence
+with math_verify. Works for any task with a \\boxed{} answer (MATH-500, AIME).
+IFEval uses a separate scorer (score_ifeval).
 """
 
 from __future__ import annotations
@@ -19,16 +17,11 @@ import pandas as pd
 from math_verify import parse as _mv_parse, verify as _mv_verify
 
 
-# answer extraction
-
 _BOXED_PREFIXES = ("\\boxed", "\\fbox")
 
 
 def extract_boxed(text: str) -> str | None:
-    """Return the contents of the last \\boxed{...} or \\fbox{...}.
-
-    Brace matching keeps nested braces, so \\boxed{\\frac{1}{2}} gives \\frac{1}{2}.
-    """
+    """Contents of the last \\boxed{...} or \\fbox{...}, with nested braces."""
     if not isinstance(text, str) or not text:
         return None
     candidates: list[str] = []
@@ -63,7 +56,7 @@ def extract_boxed(text: str) -> str | None:
             start = k + 1
     if candidates:
         return candidates[-1].strip()
-    # Fall back to "final answer: ..." style completions with no box.
+    # Fallback for "final answer: ..." completions without a box.
     m = re.search(
         r"(?:final answer|answer)\s*[:=]\s*\$?([^\n$]+?)\$?\s*$",
         text,
@@ -74,81 +67,97 @@ def extract_boxed(text: str) -> str | None:
     return None
 
 
-# equivalence
+def is_correct(pred: str | None, ref: str | None) -> tuple[bool, str | None]:
+    """Check equivalence via math_verify.
 
-
-def is_correct(pred: str | None, ref: str | None) -> bool:
-    """True if pred and ref are equivalent per math_verify."""
+    Returns (correct, error). error is None on success, else a short string;
+    splitting these keeps parse failures out of the accuracy aggregate.
+    """
     if pred is None or ref is None:
-        return False
+        return False, None
     try:
         gold = _mv_parse(f"${ref}$")
         guess = _mv_parse(f"${pred}$")
-        return bool(_mv_verify(gold, guess))
-    except Exception:
-        return False
-
-
-# references
+        return bool(_mv_verify(gold, guess)), None
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 
 @lru_cache(maxsize=4)
-def load_references(split: str = "test") -> dict[str, str]:
-    """Map of unique_id to answer from HuggingFaceH4/MATH-500.
+def load_references(task: str = "math500", split: str = "test") -> dict[str, str]:
+    """Map of problem_id to reference. Supported: math500, aime."""
+    from datasets import load_dataset  # heavy, lazy
 
-    A default for MATH-500. For other tasks pass Task.references() instead.
-    """
-    from datasets import load_dataset  # heavy, import only when needed
+    key = task.lower()
+    if key == "math500":
+        ds = load_dataset("HuggingFaceH4/MATH-500", split=split)
+        return {str(row["unique_id"]): str(row["answer"]) for row in ds}
+    if key == "aime":
+        # Reuse the AIME task so references stay consistent with generation.
+        from batch_invariance_bench.tasks.aime import AIME
 
-    ds = load_dataset("HuggingFaceH4/MATH-500", split=split)
-    return {str(row["unique_id"]): str(row["answer"]) for row in ds}
-
-
-# engine labels
-
-_ENGINE_LABELS = (
-    ("TMBatchInvariant", "TM"),
-    ("Fxpr", "FXPR"),
-    ("FXPR", "FXPR"),
-    ("Default", "Default"),
-)
-
-
-def engine_label(engine: str) -> str:
-    """Short label for an engine key, e.g. VLLMTMBatchInvariant gives TM."""
-    for needle, label in _ENGINE_LABELS:
-        if needle in engine:
-            return label
-    return engine
-
-
-# scoring entry points
+        items = AIME().load()
+        return {str(it["id"]): str(it["reference"]) for it in items}
+    raise ValueError(
+        f"no built-in references for task {task!r}; pass references= explicitly"
+    )
 
 
 def score_frame(
     df: pd.DataFrame,
     references: dict[str, str] | None = None,
+    *,
+    task: str | None = None,
 ) -> pd.DataFrame:
-    """Return a copy of df with pred, reference and correct columns.
+    """Add pred, reference, correct, score_error columns to a copy of df.
 
-    Needs problem_id and completion_text columns. references defaults to the
-    MATH-500 references.
+    Needs problem_id and completion_text. Either references or task must be
+    given; if df has a task column it must be uniform and match.
     """
     if references is None:
-        references = load_references()
+        if task is None:
+            if "task" in df.columns:
+                unique = df["task"].dropna().unique().tolist()
+                if len(unique) != 1:
+                    raise ValueError(
+                        f"score_frame: df.task has {len(unique)} unique values "
+                        f"{unique!r}; pass task= explicitly"
+                    )
+                task = str(unique[0])
+            else:
+                raise ValueError(
+                    "score_frame: pass either references= or task="
+                )
+        references = load_references(task)
+    elif task is not None and "task" in df.columns:
+        unique = df["task"].dropna().unique().tolist()
+        if len(unique) == 1 and str(unique[0]).lower() != task.lower():
+            raise ValueError(
+                f"score_frame: task={task!r} but df.task={unique[0]!r}"
+            )
+
     out = df.copy()
     out["pred"] = out["completion_text"].map(extract_boxed)
     out["reference"] = out["problem_id"].map(references)
-    out["correct"] = [is_correct(p, r) for p, r in zip(out["pred"], out["reference"])]
+    verdicts = [is_correct(p, r) for p, r in zip(out["pred"], out["reference"])]
+    out["correct"] = [v[0] for v in verdicts]
+    out["score_error"] = [v[1] if v[1] is not None else "" for v in verdicts]
     return out
 
 
-def score_csv(
-    path: str | Path,
-    references: dict[str, str] | None = None,
-) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    return score_frame(df, references)
+# Older CSVs predate the engine_label column; derive it from the class name.
+_LEGACY_LABELS = (
+    ("TMBatchInvariant", "TM"),
+    ("Fxpr", "FXPR"),
+    ("Default", "Default"),
+)
+
+
+def _legacy_engine_label(engine: str) -> str:
+    for needle, label in _LEGACY_LABELS:
+        if needle in engine:
+            return label
+    return engine
 
 
 def score_dir(
@@ -156,19 +165,20 @@ def score_dir(
     *,
     pattern: str = "*.math500.csv",
     references: dict[str, str] | None = None,
+    task: str | None = None,
 ) -> pd.DataFrame:
     """Score every matching CSV in a directory into one combined frame.
 
-    Adds engine_label and source columns; gpu_name, engine, task and run_id are
-    already in the CSV. references defaults to MATH-500, so the default pattern
-    only matches MATH-500 files. Pass both to score another task.
+    Adds a source column. Falls back to a name-substring engine_label on CSVs
+    that predate the column. Either references or task must be given, or each
+    CSV must carry a task column.
     """
-    if references is None:
-        references = load_references()
     frames = []
     for csv in sorted(Path(results_dir).glob(pattern)):
-        scored = score_csv(csv, references)
-        scored["engine_label"] = scored["engine"].map(engine_label)
+        df = pd.read_csv(csv)
+        scored = score_frame(df, references, task=task)
+        if "engine_label" not in scored.columns:
+            scored["engine_label"] = scored["engine"].map(_legacy_engine_label)
         scored["source"] = csv.name
         frames.append(scored)
     if not frames:
@@ -188,3 +198,10 @@ def accuracy_table(
         .sort_values(by)
         .reset_index(drop=True)
     )
+
+
+def score_ifeval(df: pd.DataFrame) -> pd.DataFrame:
+    """Score an IFEval frame via the IFEval task's grader."""
+    from batch_invariance_bench.tasks.ifeval import IFEval
+
+    return IFEval().score(df)

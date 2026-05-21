@@ -2,7 +2,7 @@ from __future__ import annotations
 
 
 def gpu_info() -> tuple[str, str]:
-    """Returns (arch, name), e.g. ('sm_90', 'NVIDIA H100'), or ('cpu', 'cpu')."""
+    """Return (arch, name), e.g. ('sm_90', 'NVIDIA H100'), or ('cpu', 'cpu')."""
     try:
         import torch
     except ImportError:
@@ -15,8 +15,30 @@ def gpu_info() -> tuple[str, str]:
 
 
 def vllm_version() -> str:
+    """vLLM's installed version, or 'unknown'."""
+    from importlib.metadata import PackageNotFoundError, version
+
     try:
-        import vllm
-    except ImportError:
+        return version("vllm")
+    except PackageNotFoundError:
         return "unknown"
-    return getattr(vllm, "__version__", "unknown")
+
+
+def assert_single_gpu() -> None:
+    """Raise if more than one CUDA device is visible.
+
+    gpu_name reports device 0 only; multi-GPU runs would silently mislabel
+    rows. Set CUDA_VISIBLE_DEVICES=0 on multi-GPU hosts.
+    """
+    try:
+        import torch
+    except ImportError:
+        return
+    if not torch.cuda.is_available():
+        return
+    n = torch.cuda.device_count()
+    if n > 1:
+        raise RuntimeError(
+            f"{n} CUDA devices visible; this harness is single-GPU only. "
+            f"Set CUDA_VISIBLE_DEVICES=<one index>."
+        )

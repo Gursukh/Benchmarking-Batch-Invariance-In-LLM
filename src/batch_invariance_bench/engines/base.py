@@ -1,16 +1,10 @@
-"""Engine classes.
-
-Engine is the contract the correctness harness uses: setup, generate, teardown.
-VLLMBase is the shared vLLM implementation that the batch-invariance modes
-subclass. VLLMBase.server_spec() turns an engine into a ServerSpec, which the
-perf harness uses to launch a matching `vllm serve` process.
-"""
+"""Engine contract used by both runners: setup, generate, teardown."""
 
 from __future__ import annotations
 
 import gc
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 from transformers import AutoTokenizer
@@ -30,37 +24,15 @@ class Sample:
     stop_reason: str
 
 
-@dataclass(frozen=True)
-class ServerSpec:
-    """Everything needed to launch a `vllm serve` process for one engine.
-
-    Built only by VLLMBase.server_spec() and read by perf.server.VLLMServer.
-    `env` already has VLLM_PLUGINS set from `plugins`.
-    """
-
-    key: str
-    model_id: str
-    dtype: str
-    max_model_len: int
-    env: dict[str, str] = field(default_factory=dict)
-    cli: tuple[str, ...] = field(default_factory=tuple)
-    plugins: tuple[str, ...] = field(default_factory=tuple)
-
-
 class Engine(ABC):
     """A model with a particular batch-invariance setting."""
 
-    # Short label like "Default" or "TM"; subclasses set it.
     label: str = ""
-
     name: str
 
     @property
     def key(self) -> str:
-        """Stable engine id used in filenames and the `engine` CSV column.
-
-        One class maps to one key.
-        """
+        """Stable class-name id used in filenames and the engine CSV column."""
         return type(self).__name__
 
     @abstractmethod
@@ -79,8 +51,8 @@ class Engine(ABC):
     def teardown(self) -> None: ...
 
 
-# Default config. Class attrs point at these; __init__ always copies them,
-# so the shared dicts are never changed in place.
+# Class attrs point at these; __init__ always copies them so the shared
+# dicts are never mutated in place.
 DEFAULT_SAMPLING: dict = {
     "temperature": 0,
     "max_tokens": 2048,
@@ -114,11 +86,9 @@ class VLLMBase(Engine):
     ) -> None:
         self._llm: LLM | None = None
         self._tokenizer = None
-        # Per-instance overrides beat the class defaults. Always a fresh dict.
         self.vllm_kwargs = {**type(self).vllm_kwargs, **(vllm_kwargs or {})}
-        # model / dtype / max_model_len can come in via vllm_kwargs; pull them
-        # onto the instance so the in-process LLM and the server spec agree.
-        # vLLM's "model" kwarg is our hf_id.
+        # model / dtype / max_model_len may arrive via vllm_kwargs; pull them
+        # onto the instance so the in-process LLM and the engine spec agree.
         self.hf_id = self.vllm_kwargs.pop("model", type(self).hf_id)
         self.dtype = self.vllm_kwargs.pop("dtype", type(self).dtype)
         self.max_model_len = self.vllm_kwargs.pop(
@@ -130,8 +100,6 @@ class VLLMBase(Engine):
 
     def setup(self) -> None:
         self._tokenizer = AutoTokenizer.from_pretrained(self.hf_id)
-        # dtype / max_model_len were already resolved in __init__.
-        # _extra_vllm_kwargs() lets a subclass add kwargs without storing them.
         llm_kwargs = {
             "model": self.hf_id,
             "dtype": self.dtype,
@@ -141,8 +109,26 @@ class VLLMBase(Engine):
         }
         self._llm = LLM(**llm_kwargs)
 
+    @property
+    def llm(self) -> LLM:
+        """The underlying vllm.LLM. Raises if setup() hasn't been called."""
+        if self._llm is None:
+            raise RuntimeError(
+                f"engine {self.name!r} has no LLM; call setup() before .llm"
+            )
+        return self._llm
+
+    @property
+    def tokenizer(self):
+        """The underlying tokenizer. Raises if setup() hasn't been called."""
+        if self._tokenizer is None:
+            raise RuntimeError(
+                f"engine {self.name!r} has no tokenizer; call setup() before .tokenizer"
+            )
+        return self._tokenizer
+
     def _extra_vllm_kwargs(self) -> dict:
-        """Extra vllm.LLM() kwargs, computed at setup. Base engine adds none."""
+        """Extra LLM() kwargs computed at setup. Base adds none."""
         return {}
 
     def _apply_chat_template(self, prompt: str) -> str:
@@ -172,7 +158,7 @@ class VLLMBase(Engine):
             samples: list[Sample] = []
             for comp in req.outputs:
                 token_ids = list(comp.token_ids)
-                # vLLM gives logprobs as a list of {token_id: Logprob} dicts.
+                # vLLM returns logprobs as a list of {token_id: Logprob} dicts.
                 # Pull the chosen token's logprob per step, NaN if missing.
                 if comp.logprobs is not None:
                     logprobs = [
@@ -200,39 +186,6 @@ class VLLMBase(Engine):
                 )
             result.append(samples)
         return result
-
-    def _server_env(self) -> dict[str, str]:
-        """Env vars (besides VLLM_PLUGINS) the server needs. Base engine: none."""
-        return {}
-
-    def _server_cli(self) -> list[str]:
-        """Extra `vllm serve` CLI flags for this engine."""
-        return []
-
-    def _server_plugins(self) -> list[str]:
-        """vLLM plugin names this engine needs in the server.
-
-        Becomes the VLLM_PLUGINS allowlist. Empty means no plugins.
-        """
-        return []
-
-    def server_spec(self) -> ServerSpec:
-        """Build the `vllm serve` launch spec for this engine.
-
-        VLLM_PLUGINS is always set (empty when there are no plugins) so plugin
-        loading is explicit rather than ambient.
-        """
-        plugins = tuple(self._server_plugins())
-        env = {"VLLM_PLUGINS": ",".join(plugins), **self._server_env()}
-        return ServerSpec(
-            key=self.key,
-            model_id=self.hf_id,
-            dtype=self.dtype,
-            max_model_len=self.max_model_len,
-            env=env,
-            cli=tuple(self._server_cli()),
-            plugins=plugins,
-        )
 
     def teardown(self) -> None:
         del self._llm

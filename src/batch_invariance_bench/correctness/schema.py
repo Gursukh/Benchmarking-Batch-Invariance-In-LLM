@@ -1,4 +1,4 @@
-"""CSV schema for the correctness (batch-invariance) harness."""
+"""CSV schema for the correctness harness."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ OUTPUT_COLUMNS = [
     "gpu_arch",
     "gpu_name",
     "engine",
+    "engine_label",
     "vllm_version",
     "task",
     "problem_id",

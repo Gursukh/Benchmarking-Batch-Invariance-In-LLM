@@ -22,7 +22,6 @@ class AIME(HFTask):
     hf_dataset = "Maxwell-Jia/AIME_2024"
     default_split = "train"
 
-    # Dataset field names; override in a subclass for a different source.
     problem_field = "Problem"
     answer_field = "Answer"
     id_field = "ID"
@@ -35,11 +34,9 @@ class AIME(HFTask):
         )
 
     def score(self, df: "pd.DataFrame") -> "pd.DataFrame":
-        # AIME answers are integers, so the boxed-answer scorer handles them.
         from batch_invariance_bench.correctness.score import score_frame
 
         return score_frame(df, references=self.references())
 
     def references(self) -> dict[str, str]:
-        """Map of problem_id to answer for this split."""
         return {it["id"]: str(it["reference"]) for it in self.load()}

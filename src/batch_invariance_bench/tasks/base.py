@@ -20,22 +20,15 @@ class Task(ABC):
 
     @abstractmethod
     def load(self) -> list[Item]:
-        """Return the task's prompts as a list of Items."""
+        """Return the task's prompts."""
 
     def score(self, df: "pd.DataFrame") -> "pd.DataFrame":
-        """Score a results frame, returning it with verdict columns added.
-
-        Optional. Tasks scored downstream (like IFEval) raise NotImplementedError.
-        """
+        """Score a results frame. Optional; tasks scored elsewhere raise."""
         raise NotImplementedError(f"task {self.name!r} has no built-in scorer")
 
 
 class HFTask(Task):
-    """A Task backed by a Hugging Face dataset.
-
-    Subclasses set hf_dataset and default_split and implement _to_item(). This
-    base handles load_dataset, the optional limit, and building the Items.
-    """
+    """Task backed by a Hugging Face dataset."""
 
     hf_dataset: str
     default_split: str = "test"

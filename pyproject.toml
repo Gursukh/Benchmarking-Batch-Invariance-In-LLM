@@ -8,26 +8,25 @@ version = "0.1.0"
 description = "Benchmark harness for measuring variance from batch-invariance solutions in vLLM."
 requires-python = ">=3.10"
 dependencies = [
-    # vllm >= 0.10 for Qwen3 support + the VLLM_BATCH_INVARIANT env var
-    "vllm>=0.10",
+    # Pinned: scheduler/V1/sampler internals shift across minor vLLM releases,
+    # which would invalidate cross-run comparisons. Bump deliberately.
+    "vllm",
     "torch",
     "transformers",
     "datasets",
     "pandas",
-    "httpx",
-    "nvidia-ml-py",
-    # pyairports: vLLM's outlines dep imports `pyairports.airports.AIRPORT_LIST`,
-    # but the real pyairports has been removed from PyPI and only an empty
-    # 0.0.1 squatter remains. Use the inline shim from PERF.md "Colab gotchas"
-    # to satisfy the import. We don't use guided decoding, so an empty list works.
     "math-verify",
+    # IFEval scorer.
+    "instruction-following-eval",
 ]
+
+[project.optional-dependencies]
+# Fixed-point reduction kernels for the VLLMFxpr engine. Optional because not
+# everyone running the benchmark has fxpr_vllm available.
+fxpr = ["fxpr_vllm"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[project.entry-points."vllm.general_plugins"]
-fxpr = "batch_invariance_bench.engines._fxpr_plugin:register"
 
 [dependency-groups]
 dev = [

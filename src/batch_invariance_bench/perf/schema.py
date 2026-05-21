@@ -1,4 +1,4 @@
-"""CSV schema and output-path helpers for the perf harness."""
+"""CSV schema and output paths for the perf harness."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ PERF_COLUMNS = [
     "gpu_arch",
     "gpu_name",
     "engine",
+    "engine_label",
     "vllm_version",
     "model_id",
     "concurrency",
@@ -26,12 +27,17 @@ PERF_COLUMNS = [
     "num_completed",
     "num_errors",
     "error_rate",
+    # ttft: prefill only, the first batch of arrivals with no queue wait.
     "ttft_mean_s",
     "ttft_p50_s",
     "ttft_p90_s",
     "ttft_p95_s",
-    # itl_* are pooled across every decoded token of every request,
-    # not per-request means. See perf/load_test.py.
+    # submit to first token: every request, including queued ones.
+    "submit_to_first_token_mean_s",
+    "submit_to_first_token_p50_s",
+    "submit_to_first_token_p90_s",
+    "submit_to_first_token_p95_s",
+    # itl: pooled inter token gaps, measured at scheduler steps.
     "itl_mean_s",
     "itl_p50_s",
     "itl_p90_s",
@@ -42,18 +48,6 @@ PERF_COLUMNS = [
     "e2e_p95_s",
     "req_output_throughput_mean",
     "overall_output_throughput",
-    "batch_running_mean",
-    "batch_running_p50",
-    "batch_running_p90",
-    "batch_running_max",
-    "batch_waiting_mean",
-    "proc_peak_vram_mb",
-    "proc_mean_vram_mb",
-    "device_peak_vram_mb",
-    "vram_source",
-    "kv_cache_mb",
-    "peak_activation_mb",
-    "gpu_blocks",
     "duration_s",
     "timestamp",
     "error",
@@ -66,24 +60,8 @@ def perf_csv_path(
     run_id: str,
     engine_name: str,
 ) -> Path:
-    """Path of the per-engine perf CSV. The run id keeps runs in separate files."""
-    return Path(out_path) / (f"{slug(gpu_name)}.{run_id}.{slug(engine_name)}.perf.csv")
-
-
-def serve_log_path(
-    out_path: str | os.PathLike,
-    gpu_name: str,
-    run_id: str,
-    engine_name: str,
-) -> Path:
-    """Path of the per-engine `vllm serve` log.
-
-    Each cell of an engine overwrites it; memory is parsed from it before the
-    next cell of that engine runs.
-    """
-    return Path(out_path) / (f"{slug(gpu_name)}.{run_id}.{slug(engine_name)}.serve.log")
+    return Path(out_path) / f"{slug(gpu_name)}.{run_id}.{slug(engine_name)}.perf.csv"
 
 
 def append_perf_row(path: str | os.PathLike, row: Mapping[str, object]) -> None:
-    """Append one row to the perf CSV (schema: PERF_COLUMNS)."""
     append_csv_rows(path, [row], PERF_COLUMNS)

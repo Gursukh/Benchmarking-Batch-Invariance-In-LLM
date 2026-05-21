@@ -1,8 +1,4 @@
-"""Set environment variables for a while, then put them back.
-
-vLLM reads some settings from os.environ when an engine is built. These helpers
-let an engine set them in setup() and undo it in teardown().
-"""
+"""Temporary env var patching, used by engines that set vLLM env vars in setup()."""
 
 from __future__ import annotations
 
@@ -12,7 +8,7 @@ from typing import Iterator, Mapping
 
 
 def apply_env(updates: Mapping[str, str]) -> dict[str, str | None]:
-    """Set the given env vars. Returns the old values for restore_env()."""
+    """Set env vars and return their old values for restore_env()."""
     prev: dict[str, str | None] = {}
     for key, value in updates.items():
         prev[key] = os.environ.get(key)
@@ -21,7 +17,7 @@ def apply_env(updates: Mapping[str, str]) -> dict[str, str | None]:
 
 
 def restore_env(prev: Mapping[str, str | None]) -> None:
-    """Undo apply_env() using the values it returned."""
+    """Undo apply_env() using its return value."""
     for key, old in prev.items():
         if old is None:
             os.environ.pop(key, None)

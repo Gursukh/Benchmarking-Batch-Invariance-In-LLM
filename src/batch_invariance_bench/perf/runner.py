@@ -1,121 +1,121 @@
 from __future__ import annotations
 
-import concurrent.futures as cf
-import dataclasses
-import random
-import subprocess
+import os
+import sys
+import threading
 import time
 import traceback
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Sequence
+from typing import Iterator, Sequence
 
-import httpx
-
-from batch_invariance_bench.common.csvio import now, write_json
-from batch_invariance_bench.common.gpu import gpu_info, vllm_version
-from batch_invariance_bench.engines.base import ServerSpec, VLLMBase
+from batch_invariance_bench.common.csvio import now, slug
+from batch_invariance_bench.common.gpu import assert_single_gpu, gpu_info, vllm_version
+from batch_invariance_bench.engines.base import VLLMBase
 from batch_invariance_bench.engines.default import VLLMDefault
 from batch_invariance_bench.engines.tm_batch_invariant import VLLMTMBatchInvariant
-from batch_invariance_bench.perf.batch_sampler import BatchSampler
-from batch_invariance_bench.perf.load_test import run_load_test
-from batch_invariance_bench.perf.log_parse import memory_from_vllm_log
+from batch_invariance_bench.perf.load_test import run_load_test, warmup
 from batch_invariance_bench.perf.schema import (
     PERF_COLUMNS,
     append_perf_row,
     perf_csv_path,
-    serve_log_path,
 )
-from batch_invariance_bench.perf.server import VLLMServer
-from batch_invariance_bench.perf.vram import VRAMSampler
 
 
-# Pinned so every engine decodes the same work: ignore_eos forces exactly
-# max_tokens tokens, temperature 0 keeps decoding deterministic.
+def perf_log_path(out_dir: Path, gpu_name: str, run_id: str) -> Path:
+    return out_dir / f"{slug(gpu_name)}.{run_id}.perf.log"
+
+
+@contextmanager
+def _tee_fd_to_file(log_path: Path) -> Iterator[Path]:
+    """Mirror stdout and stderr into log_path while still printing them.
+
+    Redirects fds 1 and 2 so output from vLLM and its subprocesses is caught
+    too. A pump thread copies each pipe to both the terminal and the log.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_path, "ab", buffering=0)
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved_stdout_fd = os.dup(1)
+    saved_stderr_fd = os.dup(2)
+
+    r_out, w_out = os.pipe()
+    r_err, w_err = os.pipe()
+    os.dup2(w_out, 1)
+    os.dup2(w_err, 2)
+    os.close(w_out)
+    os.close(w_err)
+
+    def _pump(read_fd: int, mirror_fd: int) -> None:
+        try:
+            while True:
+                chunk = os.read(read_fd, 4096)
+                if not chunk:
+                    break
+                try:
+                    os.write(mirror_fd, chunk)
+                except OSError:
+                    pass
+                try:
+                    log_file.write(chunk)
+                except OSError:
+                    pass
+        finally:
+            try:
+                os.close(read_fd)
+            except OSError:
+                pass
+
+    t_out = threading.Thread(target=_pump, args=(r_out, saved_stdout_fd), daemon=True)
+    t_err = threading.Thread(target=_pump, args=(r_err, saved_stderr_fd), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    try:
+        yield log_path
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(saved_stdout_fd, 1)
+        os.dup2(saved_stderr_fd, 2)
+        os.close(saved_stdout_fd)
+        os.close(saved_stderr_fd)
+        t_out.join(timeout=5.0)
+        t_err.join(timeout=5.0)
+        log_file.close()
+
+
+# Same work for every engine: ignore_eos forces exactly max_tokens, and
+# temperature 0 keeps decoding deterministic.
 DEFAULT_SAMPLING_PARAMS: dict = {"ignore_eos": True, "temperature": 0}
 
 
 def default_engines() -> list[VLLMBase]:
-    """The Default-vs-TM comparison PERF.md is built around.
-
-    VLLMFxpr() also works as a server engine now and can be passed to run()
-    explicitly.
-    """
     return [VLLMDefault(), VLLMTMBatchInvariant()]
 
 
-def warmup(
-    base_url: str,
-    api_key: str,
-    model_id: str,
-    n: int,
-    concurrency: int,
-) -> None:
-    """Send warmup requests at the target concurrency so the measured path is
-    hot before measurement. Raises if every warmup request fails.
+def _setup_engine_for_cell(
+    engine: VLLMBase, concurrency: int, mean_input_tokens: int
+) -> dict:
+    """Set per-cell vllm_kwargs and call engine.setup().
+
+    Floors max_num_batched_tokens at 2048 so small concurrencies still get a
+    healthy budget. Returns the saved kwargs so the caller can restore them.
     """
-    n = max(n, 2 * concurrency)
-    if n <= 0:
-        return
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": model_id,
-        "messages": [{"role": "user", "content": "warmup"}],
-        "max_tokens": 8,
-        "temperature": 0,
-    }
-    with httpx.Client(timeout=60.0) as client:
-
-        def _one(_: int) -> bool:
-            try:
-                client.post(
-                    f"{base_url}/chat/completions", headers=headers, json=payload
-                )
-                return True
-            except Exception:
-                return False
-
-        with cf.ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
-            results = list(ex.map(_one, range(n)))
-    if results and not any(results):
-        raise RuntimeError("all warmup requests failed; server appears broken")
-
-
-def _lock_gpu_clocks(mhz: int | None) -> tuple[bool, int | None]:
-    """Lock the GPU graphics clock for a steady clock across the sweep.
-
-    Best effort. Returns (locked, effective_mhz) and never raises.
-    """
+    saved = dict(engine.vllm_kwargs)
+    engine.vllm_kwargs["max_num_seqs"] = concurrency
+    engine.vllm_kwargs["max_num_batched_tokens"] = max(
+        concurrency * mean_input_tokens, 2048
+    )
     try:
-        if mhz is None:
-            out = subprocess.run(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=clocks.max.graphics",
-                    "--format=csv,noheader,nounits",
-                ],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            mhz = int(out.stdout.strip().splitlines()[0])
-        subprocess.run(["nvidia-smi", "-pm", "1"], capture_output=True, check=True)
-        subprocess.run(
-            ["nvidia-smi", f"--lock-gpu-clocks={mhz}"], capture_output=True, check=True
-        )
-        return True, mhz
-    except Exception as e:
-        print(f"[perf] GPU clock lock failed ({e}); continuing unlocked", flush=True)
-        return False, None
-
-
-def _reset_gpu_clocks() -> None:
-    try:
-        subprocess.run(
-            ["nvidia-smi", "--reset-gpu-clocks"], capture_output=True, check=True
-        )
+        engine.setup()
     except Exception:
-        pass
+        engine.vllm_kwargs = saved
+        raise
+    return saved
 
 
 def run(
@@ -129,33 +129,20 @@ def run(
     requests_per_concurrency: int = 20,
     repeats: int = 3,
     warmup_requests: int = 5,
-    timeout_s: float = 600.0,
-    server_timeout_s: float = 600.0,
-    enforce_eager: bool = False,
-    vram_hz: float = 5.0,
-    batch_hz: float = 10.0,
     sampling_params: dict | None = None,
-    lock_gpu_clocks: bool = True,
-    gpu_clock_mhz: int | None = None,
     seed: int = 0,
-    port: int = 8000,
-    api_key: str = "token-abc123",
+    use_random_tokens: bool = False,
+    target_duration_s: float | None = None,
     out_path: str | Path | None = None,
 ) -> Path:
-    """Run every (engine, concurrency, repeat) cell.
+    """Run every engine, concurrency and repeat cell against in-process vLLM.
 
-    Each cell appends one row to its engine's CSV. A run produces one .perf.csv
-    and one .serve.log per engine, plus <run_id>.run_manifest.json.
-
-    `engines` defaults to default_engines(). Each engine is turned into a
-    `vllm serve` spec via server_spec(), so the served run matches it exactly.
-
-    Cells run in a fixed-seed shuffled order, so Default and TM see the same
-    average thermal and clock conditions instead of one running fully first.
-
-    enforce_eager defaults to False, keeping CUDA graphs and torch.compile on.
-    Set it True only for an eager comparison run.
+    Each cell builds a fresh LLM at max_num_seqs=concurrency, runs one batch,
+    and appends the per-request and throughput stats to the engine CSV.
+    Refuses to run with more than one GPU visible since we only read device 0.
     """
+    assert_single_gpu()
+
     out_dir = Path(out_path) if out_path else Path("data/perf")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -164,149 +151,83 @@ def run(
     if sampling_params is None:
         sampling_params = dict(DEFAULT_SAMPLING_PARAMS)
 
-    # Turn each engine into its `vllm serve` launch spec.
-    specs: list[ServerSpec] = [e.server_spec() for e in engines]
-
-    # enforce_eager=False keeps CUDA graphs and torch.compile on.
-    if enforce_eager:
-        specs = [
-            s
-            if "--enforce-eager" in s.cli
-            else dataclasses.replace(s, cli=(*s.cli, "--enforce-eager"))
-            for s in specs
-        ]
-
     run_id = uuid.uuid4().hex[:12]
     arch, gpu_name = gpu_info()
     vllm_v = vllm_version()
 
-    # Shuffle the cells so Default and TM interleave.
     cells = [
-        (spec, conc, r)
-        for spec in specs
+        (engine, conc, r)
+        for engine in engines
         for conc in concurrency
         for r in range(repeats)
     ]
-    random.Random(seed).shuffle(cells)
 
-    clocks_locked, effective_mhz = False, None
-    if lock_gpu_clocks:
-        clocks_locked, effective_mhz = _lock_gpu_clocks(gpu_clock_mhz)
-
-    write_json(
-        out_dir / f"{run_id}.run_manifest.json",
-        {
-            "run_id": run_id,
-            "gpu_arch": arch,
-            "gpu_name": gpu_name,
-            "vllm_version": vllm_v,
-            "seed": seed,
-            "engines": [s.key for s in specs],
-            "concurrency": list(concurrency),
-            "repeats": repeats,
-            "sampling_params": sampling_params,
-            "enforce_eager": enforce_eager,
-            "gpu_clocks_locked": clocks_locked,
-            "gpu_clock_mhz": effective_mhz,
-            "cell_order": [
-                {"engine": s.key, "concurrency": c, "repeat_idx": r}
-                for (s, c, r) in cells
-            ],
-            "outputs": {
-                s.key: {
-                    "csv": str(perf_csv_path(out_dir, gpu_name, run_id, s.key)),
-                    "log": str(serve_log_path(out_dir, gpu_name, run_id, s.key)),
-                }
-                for s in specs
-            },
-            "timestamp": now(),
-        },
-    )
-
+    log_path = perf_log_path(out_dir, gpu_name, run_id)
     print(
         f"[perf] out_dir={out_dir} run_id={run_id} cells={len(cells)} "
-        f"engines={[s.key for s in specs]} concurrency={list(concurrency)} "
-        f"repeats={repeats} clocks_locked={clocks_locked}",
+        f"engines={[e.name for e in engines]} concurrency={list(concurrency)} "
+        f"repeats={repeats}",
         flush=True,
     )
+    print(f"[perf] log={log_path}", flush=True)
 
-    try:
-        for spec, conc, repeat_idx in cells:
+    with _tee_fd_to_file(log_path):
+        for engine, conc, repeat_idx in cells:
             t_cell = time.perf_counter()
-            log_path = serve_log_path(out_dir, gpu_name, run_id, spec.key)
-            csv_path = perf_csv_path(out_dir, gpu_name, run_id, spec.key)
+            csv_path = perf_csv_path(out_dir, gpu_name, run_id, engine.name)
             effective_max_requests = max(max_requests, requests_per_concurrency * conc)
 
-            tag = f"{spec.key} | c={conc} | r={repeat_idx}"
+            tag = f"{engine.name} | c={conc} | r={repeat_idx}"
             print(f"[{tag}] setup...", flush=True)
-            server = VLLMServer(spec, port=port, log_path=log_path)
             error: str | None = None
             test_summary: dict = {}
-            vram_summary: dict = {}
-            batch_summary: dict = {}
             t_run = 0.0
 
+            saved_kwargs: dict | None = None
             try:
-                server.start(timeout_s=server_timeout_s)
-                print(
-                    f"[{tag}] ready ({time.perf_counter() - t_cell:.1f}s)", flush=True
+                saved_kwargs = _setup_engine_for_cell(
+                    engine, conc, mean_input_tokens
                 )
-                warmup(server.base_url, api_key, spec.model_id, warmup_requests, conc)
+                print(
+                    f"[{tag}] ready ({time.perf_counter() - t_cell:.1f}s)",
+                    flush=True,
+                )
+                warmup(
+                    engine.llm,
+                    engine.hf_id,
+                    warmup_requests,
+                    conc,
+                    sampling_params=sampling_params,
+                    seed=seed,
+                )
 
                 t_run_start = time.perf_counter()
-                with (
-                    VRAMSampler(server_pgid=server.pgid, hz=vram_hz) as vram,
-                    BatchSampler(base_url=server.base_url, hz=batch_hz) as batch,
-                ):
-                    test_summary = run_load_test(
-                        model_id=spec.model_id,
-                        base_url=server.base_url,
-                        api_key=api_key,
-                        concurrency=conc,
-                        max_requests=effective_max_requests,
-                        mean_input_tokens=mean_input_tokens,
-                        stddev_input_tokens=stddev_input_tokens,
-                        mean_output_tokens=mean_output_tokens,
-                        stddev_output_tokens=stddev_output_tokens,
-                        timeout_s=timeout_s,
-                        sampling_params=sampling_params,
-                        seed=seed,
-                    )
+                test_summary = run_load_test(
+                    llm=engine.llm,
+                    model_id=engine.hf_id,
+                    concurrency=conc,
+                    max_requests=effective_max_requests,
+                    mean_input_tokens=mean_input_tokens,
+                    stddev_input_tokens=stddev_input_tokens,
+                    mean_output_tokens=mean_output_tokens,
+                    stddev_output_tokens=stddev_output_tokens,
+                    sampling_params=sampling_params,
+                    seed=seed,
+                    use_random_tokens=use_random_tokens,
+                    target_duration_s=target_duration_s,
+                )
                 t_run = time.perf_counter() - t_run_start
-                vram_summary = {
-                    "proc_peak_vram_mb": vram.proc_peak_mb,
-                    "proc_mean_vram_mb": vram.proc_mean_mb,
-                    "device_peak_vram_mb": vram.device_peak_mb,
-                    "vram_source": vram.vram_source,
-                }
-                batch_summary = {
-                    "batch_running_mean": batch.running_mean,
-                    "batch_running_p50": batch.running_p50,
-                    "batch_running_p90": batch.running_p90,
-                    "batch_running_max": batch.running_max,
-                    "batch_waiting_mean": batch.waiting_mean,
-                }
             except Exception as e:
                 error = f"{type(e).__name__}: {e}"
                 print(f"[{tag}] ERROR\n{traceback.format_exc()}", flush=True)
             finally:
-                server.stop()
+                try:
+                    engine.teardown()
+                except Exception as e:
+                    print(f"[{tag}] teardown error: {e}", flush=True)
+                if saved_kwargs is not None:
+                    engine.vllm_kwargs = saved_kwargs
                 print(f"[{tag}] teardown", flush=True)
-
-            mem = memory_from_vllm_log(log_path)
-            if error is None and not mem:
-                print(
-                    f"[{tag}] WARNING: no memory fields parsed from {log_path}; "
-                    f"the vllm-log patterns may be stale for this vLLM version",
-                    flush=True,
-                )
-            mem_row: dict = {}
-            if "kv_cache_gib" in mem:
-                mem_row["kv_cache_mb"] = mem["kv_cache_gib"] * 1024
-            if "peak_activation_gib" in mem:
-                mem_row["peak_activation_mb"] = mem["peak_activation_gib"] * 1024
-            if "gpu_blocks" in mem:
-                mem_row["gpu_blocks"] = mem["gpu_blocks"]
 
             row = {col: "" for col in PERF_COLUMNS}
             row.update(
@@ -314,9 +235,10 @@ def run(
                     "run_id": run_id,
                     "gpu_arch": arch,
                     "gpu_name": gpu_name,
-                    "engine": spec.key,
+                    "engine": engine.name,
+                    "engine_label": engine.label,
                     "vllm_version": vllm_v,
-                    "model_id": spec.model_id,
+                    "model_id": engine.hf_id,
                     "concurrency": conc,
                     "repeat_idx": repeat_idx,
                     "mean_input_tokens": mean_input_tokens,
@@ -329,9 +251,6 @@ def run(
                     "error": error or "",
                 }
             )
-            row.update(vram_summary)
-            row.update(batch_summary)
-            row.update(mem_row)
             row.update({k: v for k, v in test_summary.items() if v is not None})
             append_perf_row(csv_path, row)
 
@@ -340,9 +259,5 @@ def run(
                 f"{t_run:.1f}s measured)",
                 flush=True,
             )
-    finally:
-        if clocks_locked:
-            _reset_gpu_clocks()
-            print("[perf] GPU clocks reset", flush=True)
 
     return out_dir

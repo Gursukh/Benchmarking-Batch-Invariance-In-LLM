@@ -4,13 +4,12 @@ from batch_invariance_bench.common.env import apply_env, restore_env
 from batch_invariance_bench.engines.base import VLLMBase
 
 
-# The Thinking Machines batch-invariant switch, used by both the in-process
-# engine (setup) and the server path (_server_env).
+# vLLM reads VLLM_BATCH_INVARIANT when the engine is built.
 VLLM_BATCH_INVARIANT_ENV: dict[str, str] = {"VLLM_BATCH_INVARIANT": "1"}
 
 
 class VLLMTMBatchInvariant(VLLMBase):
-    """vLLM with Thinking Machines' batch-invariant ops turned on.
+    """vLLM with Thinking Machines' batch-invariant ops enabled.
 
     https://github.com/thinking-machines-lab/batch_invariant_ops
     """
@@ -27,7 +26,6 @@ class VLLMTMBatchInvariant(VLLMBase):
         self._prev_env: dict[str, str | None] = {}
 
     def setup(self) -> None:
-        # vLLM reads VLLM_BATCH_INVARIANT when the engine is built; set it first.
         self._prev_env = apply_env(VLLM_BATCH_INVARIANT_ENV)
         super().setup()
 
@@ -37,12 +35,3 @@ class VLLMTMBatchInvariant(VLLMBase):
         finally:
             restore_env(self._prev_env)
             self._prev_env = {}
-
-    def _server_env(self) -> dict[str, str]:
-        """Env the server needs to enable batch-invariant ops."""
-        return dict(VLLM_BATCH_INVARIANT_ENV)
-
-
-# class Llama3VLLMTMBatchInvariant(VLLMTMBatchInvariant):
-#     hf_id = "meta-llama/Meta-Llama-3-8B-Instruct"
-#     max_model_len = 8192
