@@ -132,6 +132,8 @@ class VLLMBase(Engine):
         return {}
 
     def _apply_chat_template(self, prompt: str) -> str:
+        if not getattr(self._tokenizer, "chat_template", None):
+            return prompt
         return self._tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
             tokenize=False,

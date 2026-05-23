@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Iterator, Sequence
 
 from batch_invariance_bench.common.csvio import now, slug
-from batch_invariance_bench.common.gpu import assert_single_gpu, gpu_info, vllm_version
+from batch_invariance_bench.common.gpu import gpu_info, vllm_version
 from batch_invariance_bench.engines.base import VLLMBase
 from batch_invariance_bench.engines.default import VLLMDefault
 from batch_invariance_bench.engines.tm_batch_invariant import VLLMTMBatchInvariant
