@@ -15,7 +15,7 @@ class VLLMFxpr(VLLMBase):
 
     label = "FXPR"
 
-    quantization: str | None = "fixed_point_det"
+    quantization: str | None = "fixedpoint"
     attention_backend: str | None = "CUSTOM"
     fxp_int_bits: int = 32
     fxp_frac_bits: int = 16
@@ -45,8 +45,8 @@ class VLLMFxpr(VLLMBase):
     def _fxp_env(self) -> dict[str, str]:
         """Bit-width env, read by fxpr at kernel registration."""
         return {
-            "VLLM_FXP_INT_BITS": str(self.fxp_int_bits),
-            "VLLM_FXP_FRAC_BITS": str(self.fxp_frac_bits),
+            "FXPR_INT_BITS": str(self.fxp_int_bits),
+            "FXPR_FRAC_BITS": str(self.fxp_frac_bits),
         }
 
     def setup(self) -> None:
