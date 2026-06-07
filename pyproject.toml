@@ -14,10 +14,17 @@ dependencies = [
     "datasets",
     "pandas",
     "math-verify",
+    # Runtime deps of the vendored IFEval checker (tasks/_ifeval/).
+    "nltk",
+    "langdetect",
+    "immutabledict",
 ]
 
 [project.optional-dependencies]
 fxpr = ["fxpr_vllm"]
+
+[project.scripts]
+nondet = "nondet.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

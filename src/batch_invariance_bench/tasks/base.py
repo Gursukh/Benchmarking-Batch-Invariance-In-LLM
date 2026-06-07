@@ -20,10 +20,10 @@ class Task(ABC):
 
     @abstractmethod
     def load(self) -> list[Item]:
-        """Return the task's prompts."""
+        """The task's prompts."""
 
     def score(self, df: "pd.DataFrame") -> "pd.DataFrame":
-        """Score a results frame. Optional; tasks scored elsewhere raise."""
+        """Score a results frame. Optional."""
         raise NotImplementedError(f"task {self.name!r} has no built-in scorer")
 
 
@@ -45,4 +45,16 @@ class HFTask(Task):
 
     @abstractmethod
     def _to_item(self, row: dict, idx: int) -> Item:
-        """Build one Item from a dataset row."""
+        """One Item from a dataset row."""
+
+
+class BoxedTask(HFTask):
+    """HF task with a single \\boxed{} answer (MATH-500, AIME)."""
+
+    def references(self) -> dict[str, str]:
+        return {it["id"]: str(it["reference"]) for it in self.load()}
+
+    def score(self, df: "pd.DataFrame") -> "pd.DataFrame":
+        from batch_invariance_bench.correctness.score import score_frame
+
+        return score_frame(df, references=self.references())

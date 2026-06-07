@@ -1,19 +1,43 @@
-"""Engine contract used by both runners: setup, generate, teardown."""
+"""Engine contract and the vLLM engines used by both runners.
+
+A mode needing env vars before build (TM, FXPR) overrides _env(); FXPR registers
+its kernels in _on_setup(). VLLMBase does the env save/restore.
+"""
 
 from __future__ import annotations
 
 import gc
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any, Mapping
 
 import torch
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
 
+def _apply_env(updates: Mapping[str, str]) -> dict[str, str | None]:
+    """Set env vars, return old values for _restore_env()."""
+    prev: dict[str, str | None] = {}
+    for key, value in updates.items():
+        prev[key] = os.environ.get(key)
+        os.environ[key] = value
+    return prev
+
+
+def _restore_env(prev: Mapping[str, str | None]) -> None:
+    """Undo _apply_env()."""
+    for key, old in prev.items():
+        if old is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = old
+
+
 @dataclass
 class Sample:
-    """One generated completion. logprobs[i] is the chosen token's logprob at step i."""
+    """One completion; logprobs[i] is the chosen token's logprob at step i."""
 
     text: str
     token_ids: list[int]
@@ -32,7 +56,7 @@ class Engine(ABC):
 
     @property
     def key(self) -> str:
-        """Stable class-name id used in filenames and the engine CSV column."""
+        """Class-name id used in filenames and the engine CSV column."""
         return type(self).__name__
 
     @abstractmethod
@@ -44,39 +68,26 @@ class Engine(ABC):
         prompts: list[str],
         n: int,
         sampling: dict | None = None,
+        use_tqdm: bool = False,
     ) -> list[list[Sample]]:
-        """Return n samples per prompt, indexed [prompt_idx][sample_idx]."""
+        """n samples per prompt, indexed [prompt_idx][sample_idx]."""
 
     @abstractmethod
     def teardown(self) -> None: ...
 
 
-# Class attrs point at these; __init__ always copies them so the shared
-# dicts are never mutated in place.
-DEFAULT_SAMPLING: dict = {
-    "temperature": 0,
-    "max_tokens": 2048,
-    "logprobs": 1,
-}
-DEFAULT_VLLM_KWARGS: dict = {
-    "enable_prefix_caching": False,
-}
-DEFAULT_CHAT_TEMPLATE_KWARGS: dict = {
-    "enable_thinking": False,
-}
-
-
 class VLLMBase(Engine):
-    """Common vLLM setup. Subclass to swap models or batch-invariance modes."""
+    """Common vLLM setup. Subclass to swap models or modes."""
 
     label = "Default"
 
     hf_id: str = "Qwen/Qwen3-0.6B"
     dtype: str = "bfloat16"
     max_model_len: int = 4096
-    vllm_kwargs: dict = DEFAULT_VLLM_KWARGS
-    chat_template_kwargs: dict = DEFAULT_CHAT_TEMPLATE_KWARGS
-    default_sampling: dict = DEFAULT_SAMPLING
+    # __init__ copies these so the shared dicts are never mutated.
+    vllm_kwargs: dict = {"enable_prefix_caching": False}
+    chat_template_kwargs: dict = {"enable_thinking": False}
+    default_sampling: dict = {"temperature": 0, "max_tokens": 2048, "logprobs": 1}
 
     def __init__(
         self,
@@ -86,9 +97,9 @@ class VLLMBase(Engine):
     ) -> None:
         self._llm: LLM | None = None
         self._tokenizer = None
+        self._prev_env: dict[str, str | None] = {}
         self.vllm_kwargs = {**type(self).vllm_kwargs, **(vllm_kwargs or {})}
-        # model / dtype / max_model_len may arrive via vllm_kwargs; pull them
-        # onto the instance so the in-process LLM and the engine spec agree.
+        # model/dtype/max_model_len may arrive via vllm_kwargs; pull onto self.
         self.hf_id = self.vllm_kwargs.pop("model", type(self).hf_id)
         self.dtype = self.vllm_kwargs.pop("dtype", type(self).dtype)
         self.max_model_len = self.vllm_kwargs.pop(
@@ -98,7 +109,20 @@ class VLLMBase(Engine):
         self.name = name or self.key
         self.default_sampling = {**type(self).default_sampling, **(sampling or {})}
 
+    def _env(self) -> dict[str, str]:
+        """Env vars to set before build. Base sets none."""
+        return {}
+
+    def _on_setup(self) -> None:
+        """Hook after env is applied, before LLM() is built. Base does nothing."""
+
+    def _extra_vllm_kwargs(self) -> dict:
+        """Extra LLM() kwargs at setup. Base adds none."""
+        return {}
+
     def setup(self) -> None:
+        self._prev_env = _apply_env(self._env())
+        self._on_setup()
         self._tokenizer = AutoTokenizer.from_pretrained(self.hf_id)
         llm_kwargs = {
             "model": self.hf_id,
@@ -111,7 +135,7 @@ class VLLMBase(Engine):
 
     @property
     def llm(self) -> LLM:
-        """The underlying vllm.LLM. Raises if setup() hasn't been called."""
+        """The vllm.LLM; raises before setup()."""
         if self._llm is None:
             raise RuntimeError(
                 f"engine {self.name!r} has no LLM; call setup() before .llm"
@@ -120,16 +144,12 @@ class VLLMBase(Engine):
 
     @property
     def tokenizer(self):
-        """The underlying tokenizer. Raises if setup() hasn't been called."""
+        """The tokenizer; raises before setup()."""
         if self._tokenizer is None:
             raise RuntimeError(
                 f"engine {self.name!r} has no tokenizer; call setup() before .tokenizer"
             )
         return self._tokenizer
-
-    def _extra_vllm_kwargs(self) -> dict:
-        """Extra LLM() kwargs computed at setup. Base adds none."""
-        return {}
 
     def _apply_chat_template(self, prompt: str) -> str:
         if not getattr(self._tokenizer, "chat_template", None):
@@ -146,11 +166,12 @@ class VLLMBase(Engine):
         prompts: list[str],
         n: int,
         sampling: dict | None = None,
+        use_tqdm: bool = False,
     ) -> list[list[Sample]]:
         assert self._llm is not None, "call setup() first"
         params = SamplingParams(n=n, **{**self.default_sampling, **(sampling or {})})
         chat_prompts = [self._apply_chat_template(p) for p in prompts]
-        outputs = self._llm.generate(chat_prompts, params, use_tqdm=False)
+        outputs = self._llm.generate(chat_prompts, params, use_tqdm=use_tqdm)
 
         result: list[list[Sample]] = []
         for req in outputs:
@@ -160,8 +181,8 @@ class VLLMBase(Engine):
             samples: list[Sample] = []
             for comp in req.outputs:
                 token_ids = list(comp.token_ids)
-                # vLLM returns logprobs as a list of {token_id: Logprob} dicts.
-                # Pull the chosen token's logprob per step, NaN if missing.
+                # logprobs come as per-step {token_id: Logprob}; pull the chosen
+                # token's logprob, NaN if missing.
                 if comp.logprobs is not None:
                     logprobs = [
                         float(step_lp[tok].logprob)
@@ -190,9 +211,83 @@ class VLLMBase(Engine):
         return result
 
     def teardown(self) -> None:
-        del self._llm
-        self._llm = None
-        self._tokenizer = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        try:
+            del self._llm
+            self._llm = None
+            self._tokenizer = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        finally:
+            _restore_env(self._prev_env)
+            self._prev_env = {}
+
+
+class VLLMTMBatchInvariant(VLLMBase):
+    """vLLM with Thinking Machines batch-invariant ops.
+
+    https://github.com/thinking-machines-lab/batch_invariant_ops
+    """
+
+    label = "TM"
+
+    def _env(self) -> dict[str, str]:
+        # vLLM reads this at build time.
+        return {"VLLM_BATCH_INVARIANT": "1"}
+
+
+# Tells "argument omitted" apart from an explicit None (None means disable).
+_UNSET: Any = object()
+
+
+class VLLMFxpr(VLLMBase):
+    """vLLM with fxpr_vllm fixed-point reduction kernels."""
+
+    label = "FXPR"
+
+    quantization: str | None = "fixedpoint"
+    attention_backend: str | None = "CUSTOM"
+    fxp_int_bits: int = 32
+    fxp_frac_bits: int = 16
+
+    def __init__(
+        self,
+        name: str | None = None,
+        *,
+        quantization: str | None = _UNSET,
+        attention_backend: str | None = _UNSET,
+        fxp_int_bits: int | None = None,
+        fxp_frac_bits: int | None = None,
+        vllm_kwargs: dict | None = None,
+        sampling: dict | None = None,
+    ) -> None:
+        super().__init__(name=name, vllm_kwargs=vllm_kwargs, sampling=sampling)
+        if quantization is not _UNSET:
+            self.quantization = quantization
+        if attention_backend is not _UNSET:
+            self.attention_backend = attention_backend
+        if fxp_int_bits is not None:
+            self.fxp_int_bits = fxp_int_bits
+        if fxp_frac_bits is not None:
+            self.fxp_frac_bits = fxp_frac_bits
+
+    def _env(self) -> dict[str, str]:
+        # Read by fxpr at kernel registration.
+        return {
+            "FXPR_INT_BITS": str(self.fxp_int_bits),
+            "FXPR_FRAC_BITS": str(self.fxp_frac_bits),
+        }
+
+    def _on_setup(self) -> None:
+        # Env (set by setup) must land before register() reads it.
+        from fxpr_vllm.register import register
+
+        register()
+
+    def _extra_vllm_kwargs(self) -> dict:
+        extra: dict = {}
+        if self.quantization is not None:
+            extra["quantization"] = self.quantization
+        if self.attention_backend is not None:
+            extra["attention_backend"] = self.attention_backend
+        return extra

@@ -1,4 +1,4 @@
-"""CSV helpers shared by both runners."""
+"""CSV helpers shared by the runners."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def append_csv_rows(
     rows: Iterable[Mapping[str, object]],
     fieldnames: Sequence[str],
 ) -> None:
-    """Append rows, writing the header first if the file is new."""
+    """Append rows, writing the header if the file is new."""
     p = Path(path)
     fieldnames = list(fieldnames)
     is_new = not p.exists() or p.stat().st_size == 0

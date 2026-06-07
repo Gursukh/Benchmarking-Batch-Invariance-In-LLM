@@ -1,9 +1,7 @@
-"""In-process load generator for offline inference.
+"""In-process load generator: submit all requests, drive engine.step() to the end.
 
-Submits all requests at once, then drives engine.step() until they finish.
-We avoid LLM.generate() because vLLM v1 leaves the metrics empty. TTFT is
-reported as prefill only and as submit to first token; ITL is the pooled
-inter token gaps measured at step boundaries.
+Avoids LLM.generate() since vLLM v1 leaves its metrics empty. TTFT is reported as
+prefill-only and as submit-to-first-token; ITL is pooled inter-token gaps.
 """
 
 from __future__ import annotations
@@ -101,7 +99,7 @@ def warmup(
     sampling_params: dict | None = None,
     seed: int = 0,
 ) -> None:
-    """Warmup batch at the target concurrency so kernels are hot."""
+    """Run a batch at target concurrency so kernels are hot."""
     n = max(n, 2 * concurrency)
     if n <= 0:
         return
@@ -132,10 +130,10 @@ def run_load_test(
     use_random_tokens: bool = False,
     target_duration_s: float | None = None,
 ) -> dict:
-    """Submit up to max_requests and drive engine.step() to completion.
+    """Submit up to max_requests, drive to completion, return perf-row stats.
 
-    Returns a dict for the perf row schema. With target_duration_s set, stop
-    adding requests once the time budget passes; in flight ones still finish.
+    With target_duration_s set, stop adding requests past the budget; in-flight
+    ones still finish.
     """
     if sampling_params is None:
         sampling_params = {"ignore_eos": True, "temperature": 0}

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 
 def gpu_info() -> tuple[str, str]:
-    """Return (arch, name), e.g. ('sm_90', 'NVIDIA H100'), or ('cpu', 'cpu')."""
+    """(arch, name), e.g. ('sm_90', 'NVIDIA H100'), else ('cpu', 'cpu')."""
     try:
         import torch
     except ImportError:
@@ -15,7 +15,7 @@ def gpu_info() -> tuple[str, str]:
 
 
 def vllm_version() -> str:
-    """vLLM's installed version, or 'unknown'."""
+    """Installed vLLM version, or 'unknown'."""
     from importlib.metadata import PackageNotFoundError, version
 
     try:
